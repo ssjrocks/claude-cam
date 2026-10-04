@@ -2,14 +2,18 @@
 """Pretend to be the Claude Cam app, for testing the server without a phone.
 
 Streams a synthetic "device display" whose text comes from --display-file, so writing to that
-file simulates the device reacting to a command.
+file simulates the device reacting to a command. Put GIF in the text for a 24 fps animation, and
+FLICKER as well to blank every 12th animation frame. Recordings are encoded with PyAV and uploaded
+like the real app does.
 """
 
 import argparse
 import asyncio
 import io
 import json
+import math
 import struct
+import tempfile
 import time
 from pathlib import Path
 
@@ -24,7 +28,7 @@ def font(size: int):
     return ImageFont.load_default(size)
 
 
-def scene(text: str, w: int, h: int, torch: bool) -> Image.Image:
+def scene(text: str, w: int, h: int, torch: bool, t: float | None = None) -> Image.Image:
     im = Image.new("RGB", (w, h), (60, 58, 54) if torch else (38, 36, 33))
     d = ImageDraw.Draw(im)
     # a "device" with a display in the middle
@@ -32,6 +36,13 @@ def scene(text: str, w: int, h: int, torch: bool) -> Image.Image:
     d.rectangle((w * 0.22, h * 0.3, w * 0.78, h * 0.62), fill=(10, 40, 30))
     d.text((w * 0.25, h * 0.36), text, font=font(h // 12), fill=(120, 255, 170))
     d.ellipse((w * 0.25, h * 0.68, w * 0.25 + h * 0.05, h * 0.73), fill=(255, 60, 40) if "LED" in text else (60, 20, 20))
+    if "GIF" in text:
+        n = math.floor((time.time() if t is None else t) * 24)  # a 24 fps animation
+        if "FLICKER" in text and n % 12 == 0:
+            d.rectangle((w * 0.22, h * 0.3, w * 0.78, h * 0.62), fill=(0, 0, 0))
+        else:
+            x = w * 0.25 + (n % 20) * w * 0.022
+            d.rectangle((x, h * 0.48, x + w * 0.05, h * 0.58), fill=(255, 220, 60))
     return im
 
 
@@ -59,7 +70,33 @@ async def run(url: str, display_file: Path) -> None:
 
         def status() -> dict:
             return {"type": "status", "battery": 77, "charging": True, "camera_ready": True, "zoom_min": 0.6, "zoom_max": 10.0,
-                    "exposure_min": -8, "exposure_max": 8, "exposure_step": 0.25, "has_flash": True, "orientation": 0, **state}
+                    "exposure_min": -8, "exposure_max": 8, "exposure_step": 0.25, "has_flash": True, "orientation": "portrait",
+                    "video_fps": [30, 60], "video_qualities": ["720p", "1080p"], "high_speed_fps": [120, 240],
+                    "high_speed_qualities": ["720p"], **state}
+
+        rec = {}
+        base = url.replace("ws://", "http://").split("/ws/")[0]
+
+        async def finish_recording(token: str, fps: int, size: tuple[int, int], t0: float, t1: float) -> None:
+            import av  # only needed for recordings
+
+            text = display_file.read_text().strip() if display_file.exists() else "READY"
+            path = Path(tempfile.mkdtemp()) / "rec.mp4"
+
+            def encode():
+                with av.open(str(path), "w") as out:
+                    stream = out.add_stream("libx264", rate=fps)
+                    stream.width, stream.height = size
+                    stream.pix_fmt = "yuv420p"
+                    stream.options = {"preset": "ultrafast"}
+                    for k in range(max(1, round((t1 - t0) * fps))):
+                        frame = av.VideoFrame.from_image(scene(text, *size, state["torch"], t0 + k / fps))
+                        out.mux(stream.encode(frame))
+                    out.mux(stream.encode(None))
+
+            await asyncio.to_thread(encode)
+            async with session.post(f"{base}/upload/{token}", data=path.read_bytes()) as r:
+                print("upload ->", r.status, await r.text())
 
         await ws.send_str(json.dumps(status()))
 
@@ -92,6 +129,17 @@ async def run(url: str, display_file: Path) -> None:
                     if isinstance(state["focus"], list):
                         state["focus"] = f"locked at {state['focus']}"
                     await ws.send_str(json.dumps({"type": "result", "req": m["req"], "ok": True, "state": status()}))
+                elif t == "record_start":
+                    fps = 240 if m["fps"] > 120 else (120 if m["fps"] > 60 else min(60, m["fps"]))
+                    size = (1280, 720) if fps > 60 else ((1920, 1080) if m.get("quality") == "1080p" else (1280, 720))
+                    rec.update(token=m["token"], fps=fps, size=size, t0=time.time())
+                    await ws.send_str(json.dumps({"type": "result", "req": m["req"], "ok": True, "fps": fps, "width": size[0],
+                                                  "height": size[1], "high_speed": fps > 60, "notes": []}))
+                elif t == "record_stop":
+                    await ws.send_str(json.dumps({"type": "result", "req": m["req"], "ok": True}))
+                    if rec.get("token") == m.get("token"):
+                        asyncio.create_task(finish_recording(rec["token"], rec["fps"], rec["size"], rec["t0"], time.time()))
+                        rec.clear()
                 elif t == "message" and m.get("ack"):
                     async def ack(mid=m["id"]):
                         await asyncio.sleep(1.5)

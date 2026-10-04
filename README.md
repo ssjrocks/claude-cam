@@ -22,6 +22,10 @@ instead of asking you to describe what you see.
 - **Hardware and electronics.** Claude flashes your ESP32 or Arduino, then checks the LED or display itself.
 - **Screens Claude can't read from software.** A TV, a kiosk, a printer panel, an e-ink display, another phone.
 - **Long-running things.** Claude watches a boot sequence or a print and reacts when something changes.
+- **Things too fast to see.** Claude records high-speed clips (up to 240 fps on phones that allow it) and
+  measures every frame. It can tell you the real frame rate of a GIF on a little LCD, find one glitched
+  frame, or check whether a screen really goes black.
+- **Demo and how-to videos.** Claude starts a recording, does the work, stops, and pulls out stills for docs.
 - **Less back-and-forth.** No more "what does it say now?" after every step.
 
 ## What you need
@@ -104,6 +108,10 @@ Claude when the camera is useful.
   vibrates, and you tap **Done** when you've done it.
 - **Prop the phone up** if Claude needs to watch for changes. A hand-held phone always looks like it's changing.
 - The camera only works **while the app is open on screen.** The screen stays on for you.
+- When Claude records, a red **REC** badge shows the time. Tap it to stop the recording. During a
+  high-speed clip the preview freezes for those few seconds; that's normal.
+- **Share → Claude Cam** sends any video from your gallery or camera app to Claude. For really fast
+  things Claude may ask you to film in your camera's own **Slow motion** mode and share it.
 
 <br clear="right">
 
@@ -117,6 +125,16 @@ Claude when the camera is useful.
 | `camera_wait_for_change` | Waits until the picture changes (a screen updates, an LED turns on) and shows before/after |
 | `camera_control` | Flashlight, zoom, exposure (great for bright screens) and focus |
 | `camera_message` | Shows you a message on the phone and can wait for you to tap Done |
+| `camera_record_video` | Records a video: high-speed clips (120/240 fps) for fast things, or start/stop recordings for demos |
+| `camera_video_frames` | Goes through a recording frame by frame: brightness, dark frames and update rate per frame, zoomed-in frames, exported stills |
+
+Videos are saved on your computer in `~/Videos/Claude Cam` (`~/Movies/Claude Cam` on macOS).
+
+**High-speed recording** depends on the phone. The app uses whatever the phone offers apps:
+CameraX's high-speed mode, or Camera2's constrained high-speed mode, which is how a Galaxy S23 records
+240 fps at 1080p. `camera_status` shows what your phone can do. Phones without either are limited to
+about 30 fps. Claude is told when that's too slow for what it's looking at, and can ask you to use your
+camera app's Slow motion instead.
 
 ## Troubleshooting
 
@@ -136,6 +154,10 @@ Claude when the camera is useful.
 Set the environment variable `CLAUDE_CAM_PORT` to another port (for example `8787`) before starting
 Claude Code, and type `your-computer-ip:8787` in the app.
 
+**After updating, Claude says a camera tool isn't available or is "unknown"**
+Restart all your Claude Code sessions. The first session that started keeps running the old version
+of Claude Cam until it restarts.
+
 **"Another phone took over"**
 Claude Cam talks to one phone at a time. Tap the status bar on the phone you want to use.
 
@@ -145,9 +167,10 @@ Claude Cam talks to one phone at a time. Tap the status bar on the phone you wan
 ## Privacy and security
 
 - The camera streams **only while the app is open on screen**, and the badge shows you when Claude looks.
-- Frames stay **on your computer**, in memory, for about 90 seconds. They're never saved to disk.
-  When Claude actually looks at a picture, that image becomes part of your conversation with
-  Claude, like any image you paste in.
+- Live frames stay **on your computer**, in memory, for about 90 seconds. Videos are saved only when
+  Claude records one (the phone shows REC) or you share one to Claude Cam, and they stay in your
+  Videos folder. When Claude actually looks at a picture, that image becomes part of your
+  conversation with Claude, like any image you paste in.
 - Your phone connects to your computer over your **local network** on port 8777. From the network,
   only that phone connection and a small download page are reachable. The pictures and controls
   only answer to programs on the computer itself.

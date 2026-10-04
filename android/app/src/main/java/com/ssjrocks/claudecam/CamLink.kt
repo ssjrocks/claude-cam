@@ -1,19 +1,30 @@
 package com.ssjrocks.claudecam
 
+import android.content.ContentResolver
 import android.content.Context
+import android.net.Uri
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
+import okio.BufferedSink
+import okio.source
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString.Companion.toByteString
 import org.json.JSONException
 import org.json.JSONObject
+import java.io.File
+import java.io.IOException
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -112,6 +123,50 @@ class CamLink(context: Context, private val listener: Listener) {
         val h = header.toString().toByteArray()
         val buf = ByteBuffer.allocate(4 + h.size + jpeg.size).putInt(h.size).put(h).put(jpeg)
         ws.send(buf.array().toByteString())
+    }
+
+    /** Posts a finished recording to the server; [done] runs on the main thread. */
+    fun upload(file: File, token: String, done: (ok: Boolean, message: String) -> Unit) =
+        post(token, file.asRequestBody(VIDEO), done)
+
+    /** Posts a video another app shared with us, streaming it from its content URI. */
+    fun uploadUri(uri: Uri, resolver: ContentResolver, size: Long, token: String, done: (ok: Boolean, message: String) -> Unit) =
+        post(token, object : RequestBody() {
+            override fun contentType() = VIDEO
+            override fun contentLength() = size
+            override fun writeTo(sink: BufferedSink) {
+                // OkHttp only reports IOExceptions; anything else would crash its thread.
+                val input = try {
+                    resolver.openInputStream(uri)
+                } catch (e: Exception) {
+                    throw IOException("can't read the shared video (${e.javaClass.simpleName})", e)
+                } ?: throw IOException("can't open the shared video")
+                input.source().use { sink.writeAll(it) }
+            }
+        }, done)
+
+    private fun post(token: String, body: RequestBody, done: (ok: Boolean, message: String) -> Unit) {
+        val t = target ?: return done(false, "no server address")
+        val request = Request.Builder()
+            .url("http://$t/upload/$token")
+            .post(body)
+            .build()
+        uploadClient.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                main.post { done(false, e.message ?: e.javaClass.simpleName) }
+            }
+
+            override fun onResponse(call: Call, response: okhttp3.Response) {
+                response.use {
+                    val body = it.body?.string().orEmpty().trim()
+                    main.post { done(it.isSuccessful, if (it.isSuccessful) body else "HTTP ${it.code} $body") }
+                }
+            }
+        })
+    }
+
+    private val uploadClient by lazy {
+        client.newBuilder().writeTimeout(15, TimeUnit.MINUTES).readTimeout(2, TimeUnit.MINUTES).build()
     }
 
     /** Bytes waiting to go out; used to drop stream frames when Wi-Fi can't keep up. */
@@ -247,9 +302,9 @@ class CamLink(context: Context, private val listener: Listener) {
     private fun onDiscovered(addr: String) {
         discovered.add(addr)
         if (isConnected || replaced) return
-        // Switch away from the saved address only once it has failed, so discovery never
-        // overrides a server the user typed in while that one is still connecting.
-        if (addr != target && (target == null || attempt > 0)) {
+        // Switch away from the saved address only once it has kept failing for ~20 s, so a
+        // server restart or a typed-in address isn't abandoned the moment it blips.
+        if (addr != target && (target == null || attempt >= 6)) {
             target = addr
             prefs.edit().putString("server", addr).apply()
             reconnectNow()
@@ -274,6 +329,7 @@ class CamLink(context: Context, private val listener: Listener) {
     companion object {
         const val SERVICE_TYPE = "_claudecam._tcp"
         const val DEFAULT_PORT = 8777
+        private val VIDEO = "video/mp4".toMediaType()
 
         fun normalize(raw: String): String? {
             var s = raw.trim()

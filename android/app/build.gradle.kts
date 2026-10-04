@@ -23,8 +23,8 @@ android {
         applicationId = "com.ssjrocks.claudecam"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
         buildConfigField("String", "DEFAULT_SERVER", "\"$defaultServer\"")
     }
 
@@ -60,12 +60,13 @@ android {
 }
 
 dependencies {
-    val camerax = "1.4.2"
+    val camerax = "1.5.3"
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity-ktx:1.9.3")
     implementation("androidx.camera:camera-core:$camerax")
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
+    implementation("androidx.camera:camera-video:$camerax")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

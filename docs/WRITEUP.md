@@ -177,7 +177,65 @@ that's now the default.
 to be invisible to the home network. But the emulator *could* see the mDNS advertisement, connected to
 the real server, and bumped the real phone off. That incident uncovered a genuine bug: discovery
 could override an address the user had typed in while that address was still connecting. Now
-discovery only takes over after the saved address has actually failed.
+discovery only takes over after the saved address has kept failing for about 20 seconds.
+
+## Version 1.1: seeing things too fast for the eye
+
+**Why.** Claude was helping debug GIF playback on a small LCD and misdiagnosed the problem: it
+decided the GIF had black frames. The live stream is only a few frames per second, each exposure
+can blend two screen updates, and a 20-30 fps animation falls between the samples. Claude saw "black
+or missing frames" that weren't there, and nothing told it that its sampling was too coarse.
+
+**Recording.** `camera_record_video` records MP4s on the phone and uploads them to the computer:
+- **High-speed clips (120/240 fps)**, for anything fast.
+- **Start/stop recordings at 30/60 fps**, for demos and how-to videos.
+
+`camera_video_frames` then examines a recording frame by frame.
+
+**The phone's real limits, and how we got past them.** On a Galaxy S23, CameraX reported 30 fps at
+most and no high-speed mode. A per-camera probe that also dumps the raw Camera2 characteristics showed
+something different: the main camera advertises *constrained high-speed video* at 120 and 240 fps. It
+just lacks the encoder profiles CameraX looks for. So the app now records high-speed clips directly with
+Camera2 and MediaRecorder when CameraX can't, and the S23 delivers real 240 fps at 1080p. As a further
+fallback, Claude can ask the user to film with the phone's own camera app (Samsung's Slow motion) and
+share the video to Claude Cam, which uploads it for the same analysis.
+
+**Measure every frame; don't eyeball samples.** The analysis decodes the clip with PyAV and records
+each frame's brightness and how much it changed from the previous frame. From that it reports:
+- dark-frame runs, with frame numbers;
+- the real rate at which the picture updates;
+- frames the phone dropped.
+
+Two details turned out to matter:
+- **Find the active area.** A small screen inside a big frame dilutes every whole-frame number below
+  its threshold. The analysis tracks where in the frame changes happen and reports that area
+  separately. On a synthetic test, whole-frame numbers said "8 updates/s, no dark frames", while the
+  screen alone showed the true 24 updates/s and every injected blank.
+- **Warn about undersampling.** When the picture changes in nearly every captured frame, the content
+  is at least as fast as the recording. The tool now says so in capitals, instead of quietly reporting
+  "30 updates/s" for a 60 fps video. That warning is what would have prevented the original
+  misdiagnosis.
+
+### Lessons from building it
+
+Most of the mistakes while testing 1.1 were in how the data was handled, not in the hardware. Each
+one is now a rule in the `phone-camera` skill.
+
+- **A contact sheet is a sample.** A 240 fps clip of a line crossing a screen and leaving it was
+  summarised with 16 evenly spaced frames out of 643. Most showed an empty black screen, and Claude
+  started theorising about the TV's backlight. The user had watched it and knew it was simply the
+  line being out of view. The skill now says to examine every frame of the relevant range (`step=1`,
+  cropped, with the per-frame table) before concluding anything. It also says to find out what the
+  content should look like first, not to invent hardware explanations, and to believe the user when
+  they say it looks fine. The tool output says the same: "16 of 643 frames… only a sample".
+- **Coordinate time-limited things with the person.** A one-minute test video was being recorded
+  without anyone checking it was playing. Claude now puts "Start the video, then tap Done" on the
+  phone, and records the moment Done is tapped.
+- **Keep frame numbers honest when exporting.** By default `ffmpeg` duplicates frames to fill timing
+  gaps, which shifts the numbering. `-fps_mode passthrough` keeps file `frame_0342.jpg` equal to frame #342.
+- **Version skew between sessions.** Several Claude Code sessions share one phone connection through
+  whichever session started first. After an update, a new session relaying through an old one now
+  explains that the other sessions need a restart, instead of failing with "unknown tool".
 
 ## Limitations and ideas
 
@@ -186,7 +244,10 @@ discovery only takes over after the saved address has actually failed.
 - The app has to be open on screen. A background mode with a notification ("Claude wants to see
   something") would let Claude ask for the camera when it needs it.
 - No pairing. A one-time code shown on the phone would close the "anything on the LAN" gap.
-- Ideas: on-device OCR or QR decoding, multiple cameras (several phones as fixed viewpoints), and
-  short video clips instead of frame sequences.
+- High-speed recording depends on what the phone exposes to apps. Phones without CameraX or Camera2
+  high-speed modes top out around 30 fps; their own camera app's Slow motion is the fallback.
+- No preview during a Camera2 high-speed clip (the session only allows the recorder's surface here).
+- Ideas: on-device OCR or QR decoding, multiple cameras (several phones as fixed viewpoints), smarter
+  contact sheets that favour frames where something happens, and audio for demo recordings.
 
 Contributions and ideas are welcome. Open an issue or a pull request.

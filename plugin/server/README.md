@@ -8,4 +8,4 @@ claude-cam stdio   # MCP on stdin/stdout; Claude Code starts this (the plugin do
 claude-cam serve   # always-on service; Claude Code connects to http://127.0.0.1:8777/mcp
 ```
 
-The phone connects to port 8777 (set `CLAUDE_CAM_PORT` to change it). See the main README for setup.
+Recordings are decoded with PyAV for frame-by-frame analysis. The phone connects to port 8777 (set `CLAUDE_CAM_PORT` to change it). See the main README for setup.

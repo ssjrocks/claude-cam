@@ -16,7 +16,7 @@ import threading
 
 import aiohttp
 
-from .server import CamError, McpEndpoint, PhoneServer, Settings
+from .server import VERSION, CamError, McpEndpoint, PhoneServer, Settings
 
 log = logging.getLogger("claudecam.stdio")
 
@@ -28,11 +28,14 @@ class Bridge:
         self.server: PhoneServer | None = None
         self.base = f"http://127.0.0.1:{settings.port}"
         self.lock = asyncio.Lock()
+        self.peer_version: str | None = None
 
     async def peer_alive(self) -> bool:
         try:
             async with self.session.get(self.base + "/api/status", timeout=aiohttp.ClientTimeout(total=2)) as r:
-                return r.status == 200 and "server_version" in await r.json()
+                status = await r.json() if r.status == 200 else {}
+                self.peer_version = status.get("server_version")
+                return self.peer_version is not None
         except (aiohttp.ClientError, TimeoutError, ValueError):
             return False
 
@@ -79,7 +82,14 @@ class Bridge:
                 return await self.server.tools.call(name, args)
             raise CamError("Lost the connection to the Claude Cam server; try again.") from None
         if result.get("isError"):
-            raise CamError(" ".join(c.get("text", "") for c in result["content"] if c.get("type") == "text"))
+            text = " ".join(c.get("text", "") for c in result["content"] if c.get("type") == "text")
+            if text.startswith("Unknown tool") and self.peer_version != VERSION:
+                raise CamError(
+                    f"Another Claude Code session is running an older Claude Cam ({self.peer_version}) and holds the "
+                    f"phone connection, so {name} isn't available. Ask the user to restart their other Claude Code "
+                    f"sessions (or all of them) so they pick up Claude Cam {VERSION}."
+                )
+            raise CamError(text)
         return result["content"]
 
 

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import io
 import json
 import logging
@@ -27,14 +26,30 @@ import time
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from aiohttp import WSMsgType, web
-from PIL import Image, ImageChops, ImageFilter, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 
-VERSION = "1.0.0"
+from . import video
+from .common import (
+    SENSITIVITY,
+    CamError,
+    changed_fraction,
+    clamp,
+    fmt_ts,
+    image_block,
+    jpeg_bytes,
+    parse_region,
+    pick_evenly,
+    region_box,
+    rotated,
+    text_block,
+)
+
+VERSION = "1.1.0"
 SERVICE_TYPE = "_claudecam._tcp.local."
 PACKAGE_DIR = Path(__file__).resolve().parent
 STATIC = PACKAGE_DIR / "static"
@@ -44,17 +59,7 @@ DEFAULT_PORT = int(os.environ.get("CLAUDE_CAM_PORT") or 8777)
 APK_PATH = Path(os.environ.get("CLAUDE_CAM_APK") or PACKAGE_DIR.parents[2] / "dist" / "claude-cam.apk")
 RELEASE_APK_URL = "https://github.com/ssjrocks/claude-cam/releases/latest/download/claude-cam.apk"
 
-# A pixel of the blurred greyscale thumbnail must move this many grey levels to count as
-# changed. Sensor noise and small auto-exposure drift stay below it.
-PIXEL_DELTA = 22
-# Fraction of the watched area that must change for camera_wait_for_change to fire.
-SENSITIVITY = {"low": 0.05, "medium": 0.012, "high": 0.003}
-
 log = logging.getLogger("claudecam")
-
-
-class CamError(Exception):
-    """An error that is shown to Claude as a tool error."""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -80,44 +85,6 @@ def make_thumb(jpeg: bytes) -> Image.Image:
     return im.filter(ImageFilter.GaussianBlur(1.5))
 
 
-def parse_region(value) -> tuple[float, float, float, float] | None:
-    """[x, y, w, h] as fractions of the image (0-1), origin top-left."""
-    if value in (None, "", []):
-        return None
-    if isinstance(value, str):
-        value = [float(v) for v in value.split(",")]
-    if not isinstance(value, (list, tuple)) or len(value) != 4:
-        raise CamError("A region/crop must be [x, y, width, height] as fractions of the image (0-1).")
-    x, y, w, h = (float(v) for v in value)
-    if not (0 <= x < 1 and 0 <= y < 1 and 0 < w <= 1 and 0 < h <= 1):
-        raise CamError("Region/crop values must be fractions: 0 <= x,y < 1 and 0 < width,height <= 1.")
-    return x, y, w, h
-
-
-def region_box(region, size) -> tuple[int, int, int, int]:
-    x, y, w, h = region
-    width, height = size
-    left, top = int(x * width), int(y * height)
-    right = max(left + 1, min(width, round((x + w) * width)))
-    bottom = max(top + 1, min(height, round((y + h) * height)))
-    return left, top, right, bottom
-
-
-def changed_fraction(a: Image.Image, b: Image.Image, region=None) -> float:
-    if a.size != b.size:
-        return 1.0
-    if region:
-        box = region_box(region, a.size)
-        a, b = a.crop(box), b.crop(box)
-    hist = ImageChops.difference(a, b).histogram()
-    total = sum(hist)
-    return sum(hist[PIXEL_DELTA:]) / total if total else 0.0
-
-
-def rotated(im: Image.Image, degrees: int) -> Image.Image:
-    return im.rotate(-degrees, expand=True) if degrees else im
-
-
 def render(frame: Frame, *, max_size: int, crop=None, rotate: int = 0, quality: int = 80) -> tuple[bytes, int, int]:
     """Apply EXIF orientation, extra rotation, crop and downscale. Returns (jpeg, width, height)."""
     im = Image.open(io.BytesIO(frame.jpeg))
@@ -138,25 +105,21 @@ def render(frame: Frame, *, max_size: int, crop=None, rotate: int = 0, quality: 
     return out.getvalue(), im.width, im.height
 
 
-def fmt_ts(ts: float) -> str:
-    return time.strftime("%H:%M:%S", time.localtime(ts)) + f".{int(ts % 1 * 10)} (t={ts:.2f})"
-
-
-def clamp(value, lo, hi):
-    return max(lo, min(hi, value))
-
-
-def pick_evenly(items: list, n: int) -> list:
-    if len(items) <= n:
-        return items
-    if n == 1:
-        return [items[-1]]
-    return [items[round(i * (len(items) - 1) / (n - 1))] for i in range(n)]
-
-
 # ---------------------------------------------------------------------------------------------
 # Hub: the connected phone, the frame buffer and request/response plumbing
 # ---------------------------------------------------------------------------------------------
+
+
+@dataclass
+class Recording:
+    token: str
+    name: str
+    fps: int
+    started_at: float
+    done: asyncio.Future  # resolves to the saved Path once the phone has uploaded the file
+    info: dict = field(default_factory=dict)  # what the phone reported when it started
+    stopped_by: str | None = None
+    stop_timer: asyncio.TimerHandle | None = None
 
 
 class Device:
@@ -195,6 +158,9 @@ class Hub:
         self.stream_size = 1920  # phones pick the closest size at or below, e.g. 1440x1080
         self.quality = 70
         self.lan_url = lan_url
+        self.recording: Recording | None = None
+        self.imports: dict[str, str] = {}  # upload token -> file name, for videos shared from the phone
+        self.import_waiters: list[asyncio.Future] = []
 
     # --- connection ---------------------------------------------------------------------------
 
@@ -450,6 +416,74 @@ class Hub:
         finally:
             self.acks.pop(mid, None)
 
+    # --- video recording ------------------------------------------------------------------------
+
+    async def start_recording(self, fps: int, quality: str, limit: float, name: str) -> Recording:
+        self.require_device()
+        if self.recording and not self.recording.done.done():
+            raise CamError("A recording is already running. Stop it first with camera_record_video stop=true.")
+        loop = asyncio.get_running_loop()
+        rec = Recording(uuid.uuid4().hex, name, fps, time.time(), loop.create_future())
+        self.recording = rec
+        try:
+            rec.info = await self.request(
+                {"type": "record_start", "token": rec.token, "fps": fps, "quality": quality, "max_seconds": limit},
+                timeout=20,
+            )
+        except CamError:
+            self.recording = None
+            raise
+        rec.started_at = time.time()
+        rec.stop_timer = loop.call_later(limit, lambda: asyncio.ensure_future(self._auto_stop(rec, "the time limit")))
+        return rec
+
+    async def _auto_stop(self, rec: Recording, why: str) -> None:
+        if self.recording is rec and rec.stopped_by is None and not rec.done.done():
+            rec.stopped_by = why
+            await self.safe_send({"type": "record_stop", "token": rec.token})
+
+    async def stop_recording(self, wait: float = 900) -> Recording:
+        rec = self.recording
+        if rec is None:
+            raise CamError("Nothing is being recorded. Start a recording with camera_record_video.")
+        if rec.stopped_by is None and not rec.done.done():
+            rec.stopped_by = "Claude"
+            if rec.stop_timer:
+                rec.stop_timer.cancel()
+            self.require_device()
+            await self.request({"type": "record_stop", "token": rec.token}, timeout=15)
+        try:
+            await asyncio.wait_for(asyncio.shield(rec.done), wait)
+        except TimeoutError:
+            raise CamError(
+                "The phone stopped recording but the video hasn't arrived yet (big files take a while on Wi-Fi). "
+                "Call camera_record_video with stop=true again to keep waiting."
+            ) from None
+        return rec
+
+    def on_record_event(self, data: dict) -> None:
+        rec = self.recording
+        if rec is None or data.get("token") != rec.token or rec.done.done():
+            return
+        if data.get("type") == "record_stopped" and rec.stopped_by is None:
+            rec.stopped_by = data.get("by") or "the phone"
+            if rec.stop_timer:
+                rec.stop_timer.cancel()
+        elif data.get("type") == "record_error":
+            rec.done.set_exception(CamError(f"The phone couldn't record or send the video: {data.get('error')}"))
+
+    def offer_import(self, data: dict) -> str:
+        """The user shared a video to Claude Cam; hand the phone a one-time upload token."""
+        token = uuid.uuid4().hex
+        self.imports[token] = str(data.get("name") or "video.mp4")
+        log.info("phone is sending a shared video: %s (%s bytes)", self.imports[token], data.get("size"))
+        return token
+
+    def on_import(self, path: Path) -> None:
+        for fut in self.import_waiters:
+            if not fut.done():
+                fut.set_result(path)
+
     def on_ack(self, mid: str) -> None:
         if self.message and self.message.get("id") == mid:
             self.message = None
@@ -461,14 +495,6 @@ class Hub:
 # ---------------------------------------------------------------------------------------------
 # MCP tools
 # ---------------------------------------------------------------------------------------------
-
-
-def text_block(s: str) -> dict:
-    return {"type": "text", "text": s}
-
-
-def image_block(jpeg: bytes) -> dict:
-    return {"type": "image", "data": base64.b64encode(jpeg).decode(), "mimeType": "image/jpeg"}
 
 
 REGION_SCHEMA = {
@@ -493,6 +519,21 @@ frames as soon as the picture changes and settles.
 - camera_message puts text on the phone screen (e.g. "Move closer to the LCD") and can wait for \
 the user to tap Done. camera_control sets torch, zoom, exposure and focus; lower exposure helps \
 with glowing screens.
+- The live stream is only a few frames per second. For anything faster (animations, GIF playback, \
+flicker, blinking LEDs, glitches that last one frame), record a high-speed clip with \
+camera_record_video (fps 120 or 240 if the phone supports it, a few seconds) and read the per-frame \
+statistics: dark frames and the real update rate are measured, not guessed. Look at individual \
+frames with camera_video_frames.
+- Contact sheets are samples (16 frames out of hundreds). Before concluding anything (black frames, \
+flicker, missing frames, "it works"), examine every frame of the relevant range with \
+camera_video_frames (step=1, crop to the screen, table=true), and ask the user what the content should \
+look like: dark frames are usually content, not a fault. Don't invent hardware explanations.
+- camera_record_video also makes normal 30/60 fps recordings for demos or documentation: start it, \
+do the work, stop it. Videos are saved on this computer; camera_video_frames can export stills.
+- Coordinate timing with the user. If what you need to capture has to be started by them or only \
+runs for a while (a video, an animation, a boot sequence), call camera_message with \
+wait_for_done_seconds asking them to start it, then record as soon as they tap Done. Don't \
+assume it's already running.
 - Ask the user to prop the phone up steadily when you rely on change detection.
 - The phone is a real device in the user's hands. If it disconnects, moves, or the picture goes \
 blurry or dark, ask the user whether they did something (pressed home, picked it up, the screen \
@@ -614,6 +655,95 @@ TOOLS = [
         "annotations": {"readOnlyHint": True},
     },
     {
+        "name": "camera_record_video",
+        "title": "Record a video",
+        "description": (
+            "Record a video with the phone camera and save it as an MP4 on this computer. "
+            "(1) High-speed clips to analyse anything faster than the live stream: animations, GIF playback, "
+            "screen flicker, blinking LEDs, one-frame glitches. Use fps 120 or 240 (the phone's high-speed mode, "
+            "lower resolution) or 60, and a few seconds. The result measures every frame: dark frames, how often "
+            "the picture actually updates, dropped frames. It also includes a labelled contact sheet. "
+            "(2) Normal recordings for demos or documentation: call without `seconds` to start, do the work, then "
+            "call with stop=true. During a 30/60 fps recording the live stream keeps working but photos don't; "
+            "high-speed recording pauses the live stream. Inspect any recording with camera_video_frames."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "seconds": {
+                    "type": "number",
+                    "description": "Record this long, then return the finished video (max 15 s above 60 fps, 600 s otherwise). "
+                    "Omit to start a recording that runs until you call again with stop=true.",
+                    "minimum": 0.5,
+                    "maximum": 600,
+                },
+                "stop": {"type": "boolean", "description": "Stop the running recording and return it."},
+                "fps": {
+                    "type": "integer",
+                    "description": "Frame rate: 30 (default), 60, or 120/240 for high-speed mode. The phone uses the closest "
+                    "rate it supports (camera_status lists them) and the result says what it used.",
+                    "minimum": 1,
+                    "maximum": 960,
+                },
+                "quality": {"type": "string", "enum": ["720p", "1080p", "2160p"], "description": "Resolution (default 1080p; high-speed mode uses what the phone allows)."},
+                "name": {"type": "string", "description": "Short label for the file name, e.g. 'gif-test' or 'setup-demo'."},
+                "analyze": {
+                    "type": "boolean",
+                    "description": "Frame statistics and a contact sheet in the result (default true for videos up to 30 s; longer ones get a 12-frame overview).",
+                },
+                "crop": {
+                    **REGION_SCHEMA,
+                    "description": "Analyse only this part of the picture (e.g. the screen you care about): [x, y, width, height] fractions of the upright frame.",
+                },
+                "from_camera_app": {
+                    "type": "boolean",
+                    "description": "Instead of recording, ask the user (on the phone) to record with the phone's own Camera app and "
+                    "Share it to Claude Cam, then wait for it and analyse it. Use this when the phone's built-in modes beat what "
+                    "this app can do, e.g. Samsung Slow motion at 240/960 fps when camera_status shows no high-speed mode.",
+                },
+                "message": {"type": "string", "description": "With from_camera_app: what to ask the user (default: record, then Share to Claude Cam)."},
+                "wait_seconds": {"type": "number", "description": "With from_camera_app: how long to wait for the video (default 300)."},
+                "slowdown": {
+                    "type": "number",
+                    "description": "If the video is stored slowed down (some super-slow-motion exports play 8-32x slower), the factor, "
+                    "so times and rates are reported in real time. Check the measured fps against what was recorded.",
+                },
+            },
+        },
+    },
+    {
+        "name": "camera_video_frames",
+        "title": "Look inside a recorded video",
+        "description": (
+            "Examine a recorded video (the latest by default) frame by frame. You get per-frame statistics "
+            "(brightness, dark frames, how often the picture changes, dropped frames) and the frames themselves, "
+            "as one labelled contact sheet or as separate images. Choose a time range (start_seconds/end_seconds) "
+            "or exact frames (start_frame/end_frame), then either `count` evenly spread frames or every Nth frame with "
+            "`step` (step 1 shows every frame). Use `crop` to zoom into one part, such as a small LCD; statistics then "
+            "cover just that part. `save_dir` writes the shown frames as JPEG files, e.g. stills for documentation."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "video": {"type": "string", "description": "File name or path of a recording (default: the latest)."},
+                "start_seconds": {"type": "number", "minimum": 0},
+                "end_seconds": {"type": "number", "minimum": 0},
+                "start_frame": {"type": "integer", "minimum": 0, "description": "First frame number (counted from 0)."},
+                "end_frame": {"type": "integer", "minimum": 0, "description": "Last frame number (inclusive)."},
+                "count": {"type": "integer", "minimum": 1, "maximum": 64, "description": "How many frames to show, evenly spread (default 16)."},
+                "step": {"type": "integer", "minimum": 1, "description": "Show every Nth frame of the range instead (up to `count` frames)."},
+                "layout": {"type": "string", "enum": ["sheet", "separate"], "description": "One contact sheet (default) or separate images (max 8)."},
+                "crop": {**REGION_SCHEMA, "description": "Zoom into this part: [x, y, width, height] fractions of the upright frame."},
+                "max_size": {"type": "integer", "minimum": 160, "maximum": 1920, "description": "Longest edge of separate images (default 1024)."},
+                "table": {"type": "boolean", "description": "Include a row per frame (default: when the range has at most 120 frames)."},
+                "sensitivity": {"type": "string", "enum": ["low", "medium", "high"], "description": "What counts as a picture update (default medium, about 1.2% of the area)."},
+                "save_dir": {"type": "string", "description": "Also save the shown frames as JPEG files in this folder."},
+                "slowdown": {"type": "number", "description": "If the video is stored slowed down, the factor; times and rates are then real time."},
+            },
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
         "name": "camera_control",
         "title": "Adjust the camera",
         "description": (
@@ -727,6 +857,30 @@ class Tools:
             lines.append(f"Extra rotation applied to images: {s['rotate']} deg.")
         if s["message"]:
             lines.append(f"Message on the phone screen: {s['message']!r}")
+        if d.get("video_fps") or d.get("high_speed_fps"):
+            v = f"Video: {', '.join(str(f) for f in d.get('video_fps') or [30])} fps"
+            if d.get("video_qualities"):
+                v += f" at up to {d['video_qualities'][-1]}"
+            if d.get("high_speed_fps"):
+                v += f"; high-speed {', '.join(str(f) for f in d['high_speed_fps'])} fps"
+                if d.get("high_speed_qualities"):
+                    v += f" at {'/'.join(d['high_speed_qualities'])}"
+            else:
+                v += "; no high-speed mode available to apps"
+            lines.append(v + ".")
+        if len(d.get("cameras") or []) > 1:
+            cams = "; ".join(
+                f"{c.get('label', c.get('id'))}: {', '.join(str(f) for f in c.get('fps') or [])} fps"
+                + (f", high-speed {', '.join(str(f) for f in c['high_speed_fps'])}" if c.get("high_speed_fps") else "")
+                for c in d["cameras"]
+            )
+            lines.append(f"Back cameras: {cams}. Recordings use whichever camera can do the requested frame rate.")
+        rec = hub.recording
+        if rec and not rec.done.done():
+            lines.append(f"Recording now: {time.time() - rec.started_at:.0f} s so far ({self._describe_start(rec)}).")
+        recs = video.list_recordings(3)
+        if recs:
+            lines.append(f"Recordings in {video.recordings_dir()}: latest {recs[0].name}.")
         lines.append(f"Server time: {fmt_ts(s['time'])}")
         return [text_block("\n".join(lines) + self._stall_note())]
 
@@ -897,6 +1051,214 @@ class Tools:
         status = await self.t_status({})
         return [text_block("\n".join(lines + ["Camera state now:", status[0]["text"]]))]
 
+    async def t_record_video(self, args: dict) -> list[dict]:
+        hub = self.hub
+        if args.get("from_camera_app"):
+            return await self._import_from_phone(args)
+        if args.get("stop"):
+            rec = await hub.stop_recording()
+        else:
+            fps = int(clamp(int(args.get("fps") or 30), 1, 960))
+            limit = 15.0 if fps > 60 else 600.0
+            seconds = args.get("seconds")
+            seconds = None if seconds is None else float(clamp(float(seconds), 0.5, limit))
+            quality = args.get("quality") or "1080p"
+            if quality not in ("720p", "1080p", "2160p"):
+                raise CamError("quality must be 720p, 1080p or 2160p.")
+            name = str(args.get("name") or ("clip" if seconds is not None and seconds <= 30 else "recording"))
+            rec = await hub.start_recording(fps, quality, seconds + 2 if seconds else limit, name)
+            if seconds is None:
+                return [text_block(
+                    f"Recording started: {self._describe_start(rec)}. It keeps going until you call "
+                    f"camera_record_video with stop=true (at most {limit:g} s). The phone shows a REC badge; "
+                    "the user can also stop it by tapping that badge."
+                )]
+            await asyncio.sleep(seconds)
+            rec = await hub.stop_recording()
+        stopped = f"Stopped by {rec.stopped_by}." if rec.stopped_by not in (None, "Claude") else None
+        return await self._video_report(rec.done.result(), f"Recorded with {self._describe_start(rec)}.", stopped, args)
+
+    async def _import_from_phone(self, args: dict) -> list[dict]:
+        hub = self.hub
+        hub.require_device()
+        wait = float(clamp(float(args.get("wait_seconds") or 300), 10, 1800))
+        text = str(args.get("message") or "").strip() or (
+            "Please record it with your phone's Camera app (use Slow motion for fast things), "
+            "then tap Share and choose Claude Cam."
+        )
+        fut = asyncio.get_running_loop().create_future()
+        hub.import_waiters.append(fut)
+        try:
+            await hub.show_message(text, 0, True)
+            path = await asyncio.wait_for(fut, wait)
+        except TimeoutError:
+            raise CamError(f"No video was shared to Claude Cam within {wait:g} s. The message is still on the phone.") from None
+        finally:
+            hub.import_waiters.remove(fut)
+        await hub.show_message("", 0, False)
+        return await self._video_report(path, "Shared from the phone's camera app.", None, args)
+
+    def _describe_start(self, rec: Recording) -> str:
+        i = rec.info
+        parts = [f"{i.get('fps', rec.fps)} fps"]
+        if i.get("width"):
+            parts.append(f"{i['width']}x{i['height']}")
+        if i.get("high_speed"):
+            parts.append("high-speed mode")
+        if i.get("camera"):
+            parts.append(f"{i['camera']}")
+        text = ", ".join(parts)
+        if i.get("fps") and int(i["fps"]) != rec.fps:
+            text += f" (asked for {rec.fps} fps; that's the closest the phone supports)"
+        for note in i.get("notes") or []:
+            text += f". Note: {note}"
+        return text
+
+    async def _video_report(self, path: Path, origin: str, stopped: str | None, args: dict) -> list[dict]:
+        crop = parse_region(args.get("crop"))
+        slowdown = float(args.get("slowdown") or 1.0)
+        info = await asyncio.to_thread(video.probe, path)
+        lines = [
+            f"Saved {path} ({path.stat().st_size / 1e6:.1f} MB): {info.duration:.2f} s, "
+            + (f"{info.frames} frames, " if info.frames else "")
+            + f"{info.fps:.1f} fps, {info.width}x{info.height}. {origin}"
+        ]
+        if slowdown != 1:
+            lines.append(f"Treating it as slowed down {slowdown:g}x: times and rates below are real time.")
+        if stopped:
+            lines.append(stopped)
+        analyze = args.get("analyze")
+        if analyze is None:
+            analyze = info.duration <= video.FULL_SCAN_SECONDS
+        content: list[dict] = []
+        if analyze and info.duration <= 120 and (info.frames or 0) <= video.MAX_SCAN_FRAMES:
+            sc = await asyncio.to_thread(
+                video.scan, path, crop=crop, pick=lambda st: video.even_picks(st, 16, None),
+                pick_width=None, keep=lambda st, im: im, slowdown=slowdown,
+            )
+            lines += video.summarize(sc, SENSITIVITY["medium"], crop)
+            area_lines, area = ([], None) if crop else video.active_area_lines(sc, SENSITIVITY["medium"])
+            lines += area_lines
+            if area:
+                # Show the active area (with some context) so a small screen is readable on the sheet.
+                box = video.widen(area)
+                sc.picked = [(st, im.crop(video.region_box(box, im.size))) for st, im in sc.picked]
+                where = f"the active area [{', '.join(f'{v:.2f}' for v in box)}]"
+            else:
+                where = "the crop" if crop else "the video"
+            content.append(image_block(jpeg_bytes(self._sheet(sc), 1600, 82)))
+            lines.append(
+                f"Contact sheet: {len(sc.picked)} of {len(sc.stats)} frames, evenly spaced over {where}. It's only a sample: "
+                "brief events fall between these frames, so don't judge from it. Check frame ranges with camera_video_frames "
+                "(step=1, crop, table=true) before drawing conclusions."
+            )
+        else:
+            times = [info.duration * i / 11 for i in range(12)]
+            _, frames = await asyncio.to_thread(video.sample, path, times, 640)
+            items = [(f"{t:.1f} s", im.crop(video.region_box(crop, im.size)) if crop else im) for t, im in frames]
+            if items:
+                content.append(image_block(jpeg_bytes(video.contact_sheet(items, 320, self._cols(items[0][1])), 1600, 82)))
+            lines.append("Overview: 12 frames spread over the video.")
+        lines.append(f"Look closer with camera_video_frames (video={path.name!r}): a time or frame range, step=1 for every frame, crop to zoom in.")
+        return [text_block("\n".join(lines)), *content]
+
+    @staticmethod
+    def _cols(im) -> int:
+        return 4 if im.width >= im.height else 6
+
+    def _sheet(self, sc, tile: int | None = None):
+        hash_ = "#" if sc.exact_index else "~#"
+        items = [(f"{hash_}{s.index}  {s.t * 1000:.1f} ms", im) for s, im in sc.picked]
+        cols = self._cols(items[0][1])
+        if tile is None:
+            tile = 320 if len(items) <= 16 else 240
+            if len(items) > 36:
+                cols, tile = 8, 200
+        return video.contact_sheet(items, tile, cols)
+
+    async def t_video_frames(self, args: dict) -> list[dict]:
+        path = video.resolve_video(args.get("video"))
+        frame_mode = args.get("start_frame") is not None or args.get("end_frame") is not None
+        start = args.get("start_frame" if frame_mode else "start_seconds")
+        end = args.get("end_frame" if frame_mode else "end_seconds")
+        layout = args.get("layout") or "sheet"
+        if layout not in ("sheet", "separate"):
+            raise CamError("layout must be sheet or separate.")
+        count = int(clamp(int(args.get("count") or 16), 1, 64 if layout == "sheet" else 8))
+        step = args.get("step")
+        step = int(step) if step else None
+        if step is not None and step < 1:
+            raise CamError("step must be 1 or more.")
+        crop = parse_region(args.get("crop"))
+        sensitivity = args.get("sensitivity") or "medium"
+        if sensitivity not in SENSITIVITY:
+            raise CamError("sensitivity must be low, medium or high.")
+        max_size = int(clamp(int(args.get("max_size") or 1024), 160, 1920))
+        save_dir = Path(args["save_dir"]).expanduser() if args.get("save_dir") else None
+        info = await asyncio.to_thread(video.probe, path)
+
+        if start is None and end is None and info.duration > video.FULL_SCAN_SECONDS:
+            times = [info.duration * i / max(1, count - 1) for i in range(count)]
+            _, frames = await asyncio.to_thread(video.sample, path, times, 640)
+            items = [(f"{t:.1f} s", im.crop(video.region_box(crop, im.size)) if crop else im) for t, im in frames]
+            text = (
+                f"{info.describe()}. It's longer than {video.FULL_SCAN_SECONDS} s, so here are {len(items)} frames spread "
+                "over it. Give start_seconds/end_seconds (or frame numbers) for per-frame statistics."
+            )
+            return [text_block(text), image_block(jpeg_bytes(video.contact_sheet(items, 320, self._cols(items[0][1])), 1600, 82))]
+
+        saved: list[Path] = []
+        if save_dir:
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+        def keep(stat, im):
+            if save_dir:
+                out = save_dir / f"{path.stem}_f{stat.index:05d}.jpg"
+                im.convert("RGB").save(out, quality=92)
+                saved.append(out)
+            if layout == "separate":
+                im.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            else:
+                im.thumbnail((640, 640), Image.Resampling.LANCZOS)
+            return im
+
+        pick_width = None if (save_dir or crop) else (max_size if layout == "separate" else 640)
+        sc = await asyncio.to_thread(
+            video.scan, path, start=start, end=end, frame_mode=frame_mode, crop=crop,
+            pick=lambda st: video.even_picks(st, count, step), pick_width=pick_width, keep=keep,
+            slowdown=float(args.get("slowdown") or 1.0),
+        )
+        first, last = sc.stats[0], sc.stats[-1]
+        hash_ = "#" if sc.exact_index else "~#"
+        lines = [
+            info.describe() + ".",
+            f"Range: {hash_}{first.index}-{last.index} ({first.t:.3f}-{last.t:.3f} s), {len(sc.stats)} frames; "
+            + (("showing every frame" if step == 1 else f"showing every {step}th frame") if step else "showing frames spread evenly")
+            + f" ({len(sc.picked)})" + (" of the crop" if crop else "") + ".",
+        ]
+        if len(sc.picked) < len(sc.stats):
+            lines.append(
+                f"The images are {len(sc.picked)} of the {len(sc.stats)} frames in the range; anything between them isn't shown. "
+                "Use step=1 on a narrower range to see every frame."
+            )
+        if len(sc.stats) >= video.MAX_SCAN_FRAMES:
+            lines.append(f"(Stopped after {video.MAX_SCAN_FRAMES} frames; narrow the range to go further.)")
+        lines += video.summarize(sc, SENSITIVITY[sensitivity], crop)
+        if not crop:
+            lines += video.active_area_lines(sc, SENSITIVITY[sensitivity])[0]
+        if args.get("table", len(sc.stats) <= 120):
+            lines.append(video.table(sc))
+        if saved:
+            lines.append(f"Saved {len(saved)} frames to {save_dir} (e.g. {saved[0].name}).")
+        content = [text_block("\n".join(lines))]
+        if layout == "sheet":
+            content.append(image_block(jpeg_bytes(self._sheet(sc), 1800, 82)))
+        else:
+            for s_, im in sc.picked:
+                content.append(text_block(f"{hash_}{s_.index} at {s_.t * 1000:.1f} ms"))
+                content.append(image_block(jpeg_bytes(im, max_size, 85)))
+        return content
+
     async def t_message(self, args: dict) -> list[dict]:
         wait = float(clamp(float(args.get("wait_for_done_seconds") or 0), 0, 900))
         vibrate = args.get("vibrate", True) is not False
@@ -981,7 +1343,7 @@ def origin_ok(request: web.Request) -> bool:
 
 @web.middleware
 async def local_only(request: web.Request, handler):
-    public = request.path in ("/", "/claude-cam.apk", "/ws/device", "/favicon.ico")
+    public = request.path in ("/", "/claude-cam.apk", "/ws/device", "/favicon.ico") or request.path.startswith("/upload/")
     if not public and (not is_local(request) or not origin_ok(request)):
         return web.Response(status=403, text="Claude Cam: this endpoint is only available on the server itself.\n")
     return await handler(request)
@@ -1016,6 +1378,10 @@ def build_app(hub: Hub) -> web.Application:
                             hub.resolve(data.get("req"), data)
                         else:
                             hub.resolve(data.get("req"), error=data.get("error") or "unknown error")
+                    elif kind in ("record_stopped", "record_error"):
+                        hub.on_record_event(data)
+                    elif kind == "import_offer":
+                        await dev.send({"type": "import_ready", "token": hub.offer_import(data)})
                     elif kind == "ack":
                         hub.on_ack(str(data.get("id")))
                 elif msg.type == WSMsgType.BINARY and dev is not None:
@@ -1144,6 +1510,61 @@ def build_app(hub: Hub) -> web.Application:
     app.router.add_get("/api/frame.jpg", api_frame)
     app.router.add_post("/api/control", api_control)
     app.router.add_post("/api/message", api_message)
+
+    async def upload(request: web.Request) -> web.Response:
+        """The phone posts a finished recording here, with the token from record_start."""
+        token = request.match_info["token"]
+        rec = hub.recording
+        imported = hub.imports.pop(token, None)
+        if imported is not None:
+            original = Path(imported)
+            path = video.new_recording_path(f"from-phone-{original.stem}", None, original.suffix.lower() or ".mp4")
+        elif rec is not None and token == rec.token and not rec.done.done():
+            path = video.new_recording_path(rec.name, int((rec.info or {}).get("fps") or rec.fps))
+        else:
+            raise web.HTTPForbidden(text="unknown or finished upload\n")
+        part = path.with_name(path.name + ".part")
+        size = 0
+        try:
+            with open(part, "wb") as fh:
+                async for chunk in request.content.iter_chunked(1 << 20):
+                    fh.write(chunk)
+                    size += len(chunk)
+            if size == 0:
+                raise ValueError("empty upload")
+            part.replace(path)
+        except Exception as e:  # noqa: BLE001
+            part.unlink(missing_ok=True)
+            log.warning("recording upload failed: %s", e)
+            raise web.HTTPBadRequest(text=f"upload failed: {e}\n") from None
+        log.info("video saved: %s (%.1f MB)", path, size / 1e6)
+        if imported is not None:
+            hub.on_import(path)
+        elif not rec.done.done():
+            rec.done.set_result(path)
+        return web.json_response({"ok": True, "saved": path.name})
+
+    async def api_recordings(request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "folder": str(video.recordings_dir()),
+                "recordings": [
+                    {"name": p.name, "size": p.stat().st_size, "modified": p.stat().st_mtime}
+                    for p in video.list_recordings()
+                ],
+            }
+        )
+
+    async def recording_file(request: web.Request) -> web.StreamResponse:
+        name = request.match_info["name"]
+        path = video.recordings_dir() / name
+        if "/" in name or "\\" in name or path.suffix.lower() not in (".mp4", ".mov", ".3gp", ".mkv", ".webm") or not path.is_file():
+            raise web.HTTPNotFound()
+        return web.FileResponse(path)
+
+    app.router.add_post("/upload/{token}", upload)
+    app.router.add_get("/api/recordings", api_recordings)
+    app.router.add_get("/recordings/{name}", recording_file)
 
     async def close_device(app: web.Application) -> None:
         if hub.device:

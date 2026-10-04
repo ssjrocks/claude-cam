@@ -1,3 +1,5 @@
+@file:OptIn(ExperimentalSessionConfig::class, ExperimentalHighSpeedVideo::class, ExperimentalCamera2Interop::class)
+
 package com.ssjrocks.claudecam
 
 import android.Manifest
@@ -8,6 +10,9 @@ import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
@@ -19,8 +24,10 @@ import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.text.InputType
+import android.util.Range
 import android.util.Size
 import android.view.GestureDetector
 import android.view.MotionEvent
@@ -36,9 +43,14 @@ import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.CameraState
+import androidx.camera.core.DynamicRange
+import androidx.camera.core.ExperimentalSessionConfig
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.FocusMeteringResult
 import androidx.camera.core.ImageAnalysis
@@ -46,12 +58,23 @@ import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.SessionConfig
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.TorchState
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.ExperimentalHighSpeedVideo
+import androidx.camera.video.FallbackStrategy
+import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.HighSpeedVideoSessionConfig
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
@@ -61,7 +84,9 @@ import com.google.common.util.concurrent.ListenableFuture
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.util.concurrent.Executors
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity(), CamLink.Listener {
@@ -72,6 +97,7 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
     private lateinit var statusText: TextView
     private lateinit var statsText: TextView
     private lateinit var lookBadge: TextView
+    private lateinit var recBadge: TextView
     private lateinit var torchButton: ImageButton
     private lateinit var zoomButton: TextView
     private lateinit var afButton: TextView
@@ -114,6 +140,18 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
     private val jpegBuffer = ByteArrayOutputStream(512 * 1024)
 
     private var currentMessageId: String? = null
+
+    // Video recording (see the "video" section)
+    private var activeRecording: Recording? = null
+    private var recordingToken: String? = null
+    private var recordingInfo: JSONObject? = null
+    private var recordingStartedAt = 0L
+    private var videoCaps: JSONObject? = null
+    private var backCameras: List<BackCamera> = emptyList()
+    private var pendingImport: Uri? = null // a video shared to Claude Cam, waiting to be sent
+    private var highSpeedRecorder: HighSpeedRecorder? = null // a Camera2 high-speed clip in progress
+    private var camera2Fast: List<Pair<String, Map<Size, List<Int>>>> = emptyList()
+    private val highSpeedLimit = Runnable { finishHighSpeed() }
     private var tick = 0
 
     private val hideBadge = Runnable {
@@ -123,6 +161,7 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
     private val ticker = object : Runnable {
         override fun run() {
             updateStats()
+            if (highSpeedRecorder != null) updateRecBadge()
             if (link.isConnected && tick++ % 3 == 0) sendStatus()
             main.postDelayed(this, 1000)
         }
@@ -143,6 +182,8 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
         statusText = findViewById(R.id.status_text)
         statsText = findViewById(R.id.stats_text)
         lookBadge = findViewById(R.id.look_badge)
+        recBadge = findViewById(R.id.rec_badge)
+        recBadge.setOnClickListener { stopRecordingFromPhone() }
         torchButton = findViewById(R.id.torch_button)
         zoomButton = findViewById(R.id.zoom_button)
         afButton = findViewById(R.id.af_button)
@@ -195,6 +236,12 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
         }
 
         if (hasCameraPermission()) startCamera() else requestCamera.launch(Manifest.permission.CAMERA)
+        handleShare(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleShare(intent)
     }
 
     override fun onStart() {
@@ -208,6 +255,7 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
 
     override fun onStop() {
         super.onStop()
+        finishHighSpeed() // Android takes the camera away from background apps anyway
         link.stop()
         orientationListener.disable()
         main.removeCallbacks(ticker)
@@ -242,16 +290,16 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun bindUseCases() {
-        val provider = cameraProvider ?: return
-        val ratio = AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
+    private val ratio = AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
 
-        val preview = Preview.Builder()
+    private fun buildPreview(): Preview =
+        Preview.Builder()
             .setResolutionSelector(ResolutionSelector.Builder().setAspectRatioStrategy(ratio).build())
             .build()
-        preview.setSurfaceProvider(previewView.surfaceProvider)
+            .also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
-        val analysis = ImageAnalysis.Builder()
+    private fun buildAnalysis(): ImageAnalysis =
+        ImageAnalysis.Builder()
             .setResolutionSelector(
                 ResolutionSelector.Builder()
                     .setAspectRatioStrategy(ratio)
@@ -266,9 +314,10 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setTargetRotation(targetRotation)
             .build()
-        analysis.setAnalyzer(analysisExecutor, ::analyze)
+            .also { it.setAnalyzer(analysisExecutor, ::analyze) }
 
-        val capture = ImageCapture.Builder()
+    private fun buildCapture(): ImageCapture =
+        ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
             .setJpegQuality(92)
             .setResolutionSelector(
@@ -280,6 +329,19 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
             .setTargetRotation(targetRotation)
             .build()
 
+    /** The normal setup: preview, the live stream and full-resolution photos. */
+    private fun bindUseCases() {
+        if (recordingToken != null) return // never pull the camera out from under a recording
+        val provider = cameraProvider ?: return
+        val preview = buildPreview()
+        val analysis = buildAnalysis()
+        val capture = buildCapture()
+        rebind(analysis, capture) { provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis, capture) }
+    }
+
+    /** Unbinds everything, runs [bind], and wires the new camera up to the UI. False if binding failed. */
+    private fun rebind(analysis: ImageAnalysis?, capture: ImageCapture?, bind: () -> Camera): Boolean {
+        val provider = cameraProvider ?: return false
         camera?.cameraInfo?.let { info ->
             info.cameraState.removeObservers(this)
             info.zoomState.removeObservers(this)
@@ -287,15 +349,16 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
         }
         provider.unbindAll()
         val cam = try {
-            provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis, capture)
+            bind()
         } catch (e: Exception) {
             statsText.text = "Camera error: ${e.message}"
-            return
+            return false
         }
         camera = cam
         imageAnalysis = analysis
         imageCapture = capture
         settingsApplied = false
+        if (videoCaps == null) videoCaps = try { computeVideoCaps() } catch (e: Exception) { JSONObject().put("camera_probe_error", e.toString()) }
 
         cam.cameraInfo.cameraState.observe(this) { state ->
             if (state.type == CameraState.Type.OPEN && !settingsApplied) {
@@ -312,6 +375,7 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
             torchButton.setImageResource(if (it == TorchState.ON) R.drawable.ic_flash_on else R.drawable.ic_flash_off)
         }
         updateAfButton()
+        return true
     }
 
     private fun applyCameraSettings() {
@@ -359,7 +423,11 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
     private fun takePhoto(req: String) {
         val capture = imageCapture
         if (capture == null || camera == null) {
-            link.sendError(req, "the camera is not running on the phone")
+            link.sendError(
+                req,
+                if (recordingToken != null) "photos are unavailable while a video is recording; use the live frames or stop the recording"
+                else "the camera is not running on the phone",
+            )
             return
         }
         flashPreview()
@@ -428,6 +496,519 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
         }
     }
 
+    // --- video ----------------------------------------------------------------------------------
+
+    private val qualityOrder = listOf(Quality.SD, Quality.HD, Quality.FHD, Quality.UHD)
+
+    private fun qualityName(q: Quality) = when (q) {
+        Quality.SD -> "480p"
+        Quality.HD -> "720p"
+        Quality.FHD -> "1080p"
+        Quality.UHD -> "2160p"
+        else -> null
+    }
+
+    private fun qualityFrom(name: String) = when (name) {
+        "480p" -> Quality.SD
+        "720p" -> Quality.HD
+        "2160p" -> Quality.UHD
+        else -> Quality.FHD
+    }
+
+    /** The requested quality if supported, else the best one below it, else the lowest available. */
+    private fun pickQuality(supported: List<Quality>, wanted: Quality): Quality {
+        if (wanted in supported) return wanted
+        val limit = qualityOrder.indexOf(wanted)
+        return supported.filter { qualityOrder.indexOf(it) in 0..limit }.maxByOrNull { qualityOrder.indexOf(it) }
+            ?: supported.minBy { qualityOrder.indexOf(it).let { i -> if (i < 0) 99 else i } }
+    }
+
+    /** A fixed frame rate as close to [fps] as possible (rounding down on a tie), else any range. */
+    private fun bestRange(ranges: Set<Range<Int>>, fps: Int): Range<Int>? =
+        ranges.filter { it.lower == it.upper }.minByOrNull { abs(it.upper - fps) * 2 + if (it.upper > fps) 1 else 0 }
+            ?: ranges.minByOrNull { abs(it.upper - fps) }
+
+    /** A back camera this app can open, and what it can record. */
+    private class BackCamera(
+        val id: String,
+        val info: CameraInfo,
+        val selector: CameraSelector,
+        val zoom: Float,
+        val fps: List<Int>,
+        val fast: List<Quality>,
+        val fastFps: List<Int>,
+    ) {
+        val label: String
+            get() = when {
+                zoom < 0.9f -> "ultra-wide camera"
+                zoom > 1.5f -> "telephoto camera"
+                else -> "main camera"
+            } + " (id $id)"
+    }
+
+    /** Every back camera apps can open, and (for diagnostics) what each physical sensor advertises. */
+    private fun computeVideoCaps(): JSONObject {
+        val provider = cameraProvider ?: return JSONObject()
+        val cams = provider.availableCameraInfos.filter { it.lensFacing == CameraSelector.LENS_FACING_BACK }.map { info ->
+            val id = Camera2CameraInfo.from(info).cameraId
+            val fast = try {
+                Recorder.getHighSpeedVideoCapabilities(info)?.getSupportedQualities(DynamicRange.SDR).orEmpty()
+            } catch (e: Exception) {
+                emptyList()
+            }
+            val fastFps = if (fast.isEmpty()) emptyList() else try {
+                val probe = HighSpeedVideoSessionConfig(
+                    VideoCapture.withOutput(Recorder.Builder().setQualitySelector(QualitySelector.from(fast.first())).build()),
+                )
+                info.getSupportedFrameRateRanges(probe).map { it.upper }.filter { it > 60 }.distinct().sorted()
+            } catch (e: Exception) {
+                emptyList()
+            }
+            BackCamera(
+                id,
+                info,
+                CameraSelector.Builder().addCameraFilter { list -> list.filter { Camera2CameraInfo.from(it).cameraId == id } }.build(),
+                info.intrinsicZoomRatio,
+                info.supportedFrameRateRanges.map { it.upper }.filter { it >= 24 }.distinct().sorted(),
+                fast,
+                fastFps,
+            )
+        }
+        backCameras = cams
+        val o = JSONObject()
+        val main = mainCamera()
+        if (main != null) {
+            val qualities = Recorder.getVideoCapabilities(main.info).getSupportedQualities(DynamicRange.SDR)
+            o.put("video_qualities", JSONArray(qualities.sortedBy { qualityOrder.indexOf(it) }.mapNotNull(::qualityName)))
+        }
+        o.put("video_fps", JSONArray(cams.flatMap { it.fps }.distinct().sorted()))
+        val fastest = cams.flatMap { it.fastFps }.distinct().sorted()
+        camera2Fast = try {
+            HighSpeedRecorder.candidates(this)
+        } catch (e: Exception) {
+            emptyList()
+        }
+        if (fastest.isNotEmpty()) {
+            o.put("high_speed_fps", JSONArray(fastest))
+            o.put("high_speed_qualities", JSONArray(cams.flatMap { it.fast }.distinct().sortedBy { qualityOrder.indexOf(it) }.mapNotNull(::qualityName)))
+        } else if (camera2Fast.isNotEmpty()) {
+            val sizes = camera2Fast.flatMap { it.second.entries }
+            o.put("high_speed_fps", JSONArray(sizes.flatMap { it.value }.distinct().sorted()))
+            o.put("high_speed_qualities", JSONArray(sizes.map { it.key }.sortedBy { it.width * it.height }.map { "${it.width}x${it.height}" }.distinct()))
+            o.put("high_speed_via", "camera2")
+        }
+        o.put("cameras", JSONArray(cams.map { c ->
+            JSONObject().put("id", c.id).put("label", c.label).put("zoom", c.zoom.toDouble())
+                .put("fps", JSONArray(c.fps)).put("high_speed_fps", JSONArray(c.fastFps))
+        }))
+        o.put("camera2", camera2Report())
+        return o
+    }
+
+    /** Raw Camera2 facts for every camera id and physical sensor, so we can see what the phone hides. */
+    private fun camera2Report(): JSONArray {
+        val out = JSONArray()
+        val manager = getSystemService(CameraManager::class.java) ?: return out
+        fun describe(id: String, chars: CameraCharacteristics, physicalOf: String?): JSONObject {
+            val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toList().orEmpty()
+            val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val highSpeed = try {
+                map?.highSpeedVideoFpsRanges?.map { it.upper }?.distinct()?.sorted().orEmpty()
+            } catch (e: Exception) {
+                emptyList()
+            }
+            return JSONObject().put("id", id).put("physical_of", physicalOf ?: JSONObject.NULL)
+                .put("facing", when (chars.get(CameraCharacteristics.LENS_FACING)) {
+                    CameraMetadata.LENS_FACING_BACK -> "back"
+                    CameraMetadata.LENS_FACING_FRONT -> "front"
+                    else -> "external"
+                })
+                .put("ae_fps", JSONArray(chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.map { "${it.lower}-${it.upper}" }.orEmpty()))
+                .put("high_speed_capability", CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO in caps)
+                .put("high_speed_fps", JSONArray(highSpeed))
+                .put("level", chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ?: -1)
+        }
+        try {
+            for (id in manager.cameraIdList) {
+                val chars = manager.getCameraCharacteristics(id)
+                out.put(describe(id, chars, null))
+                for (phys in chars.physicalCameraIds) {
+                    out.put(describe(phys, manager.getCameraCharacteristics(phys), id))
+                }
+            }
+        } catch (e: Exception) {
+            out.put(JSONObject().put("error", e.toString()))
+        }
+        return out
+    }
+
+    private fun mainCamera(): BackCamera? = backCameras.firstOrNull { it.zoom in 0.9f..1.5f } ?: backCameras.firstOrNull()
+
+    /** The back camera to record [fps] with: the main one unless another can get closer to the rate. */
+    private fun cameraFor(fps: Int): BackCamera? {
+        val main = mainCamera() ?: return null
+        if (fps > 60) {
+            backCameras.filter { it.fastFps.isNotEmpty() }
+                .minByOrNull { cam -> cam.fastFps.minOf { abs(it - fps) } * 10 + if (cam === main) 0 else 1 }
+                ?.let { return it }
+        }
+        fun reach(cam: BackCamera) = (cam.fps.maxOrNull() ?: 0).coerceAtMost(fps)
+        val best = backCameras.maxByOrNull { reach(it) * 10 + if (it === main) 1 else 0 } ?: main
+        return if (reach(best) > reach(main)) best else main
+    }
+
+    /**
+     * Rebinds the camera for recording and starts it. Above 60 fps it uses the phone's high-speed
+     * session (preview + video only); otherwise it keeps the live stream if the phone can run it at
+     * that frame rate alongside the video, and drops it if not. Photos are off while recording.
+     */
+    private fun startRecording(cmd: JSONObject) {
+        val req = cmd.optString("req")
+        val token = cmd.optString("token")
+        val fps = cmd.optInt("fps", 30)
+        val wanted = qualityFrom(cmd.optString("quality", "1080p"))
+        val maxSeconds = cmd.optDouble("max_seconds", 600.0)
+        val provider = cameraProvider
+        val chosenCamera = cameraFor(fps)
+        if (provider == null || camera == null || chosenCamera == null) {
+            link.sendError(req, "the camera is not running on the phone")
+            return
+        }
+        if (recordingToken != null) {
+            link.sendError(req, "already recording")
+            return
+        }
+        val info = chosenCamera.info
+        val selector = chosenCamera.selector
+        val notes = JSONArray()
+        if (chosenCamera !== mainCamera()) notes.put("recorded with the ${chosenCamera.label}, the only one that can do this frame rate (a different view)")
+        var recorder: Recorder? = null
+        var video: VideoCapture<Recorder>? = null
+        var rate: Range<Int>? = null
+        var highSpeed = false
+        var liveStream = true
+        recordingToken = token // blocks bindUseCases() from undoing this
+
+        if (fps > 60) {
+            val fast = Recorder.getHighSpeedVideoCapabilities(info)?.getSupportedQualities(DynamicRange.SDR).orEmpty()
+            if (fast.isEmpty()) {
+                val pick = pickCamera2HighSpeed(fps, wanted)
+                if (pick != null) {
+                    startCamera2HighSpeed(req, token, pick.first, pick.second, pick.third, maxSeconds, notes)
+                    return
+                }
+                notes.put("this phone has no high-speed video mode, so it recorded at its fastest normal frame rate")
+            } else {
+                val r = Recorder.Builder().setQualitySelector(QualitySelector.from(pickQuality(fast, wanted))).build()
+                val v = VideoCapture.Builder(r).setTargetRotation(targetRotation).build()
+                val preview = buildPreview()
+                val chosen = try {
+                    bestRange(info.getSupportedFrameRateRanges(HighSpeedVideoSessionConfig(v, preview)), fps)
+                } catch (e: Exception) {
+                    null
+                }
+                if (chosen != null && rebind(null, null) {
+                        provider.bindToLifecycle(this, selector, HighSpeedVideoSessionConfig(v, preview, chosen, false))
+                    }
+                ) {
+                    recorder = r
+                    video = v
+                    rate = chosen
+                    highSpeed = true
+                    liveStream = false
+                } else {
+                    notes.put("the high-speed mode couldn't start, so it recorded at a normal frame rate")
+                }
+            }
+        }
+
+        if (recorder == null) {
+            val normal = Recorder.getVideoCapabilities(info).getSupportedQualities(DynamicRange.SDR)
+            val q = if (normal.isEmpty()) wanted else pickQuality(normal, wanted)
+            val r = Recorder.Builder()
+                .setQualitySelector(QualitySelector.from(q, FallbackStrategy.lowerQualityOrHigherThan(q)))
+                .build()
+            val v = VideoCapture.Builder(r).setTargetRotation(targetRotation).build()
+            val want = fps.coerceAtMost(60)
+            val preview = buildPreview()
+            val analysis = buildAnalysis()
+            // Keep the live stream unless dropping it gets a faster frame rate.
+            val options = listOf(listOf(preview, analysis, v), listOf(preview, v)).mapNotNull { useCases ->
+                val chosen = try {
+                    bestRange(info.getSupportedFrameRateRanges(SessionConfig(useCases = useCases)), want)
+                } catch (e: Exception) {
+                    null
+                }
+                chosen?.let { useCases to it }
+            }.sortedWith(compareBy({ abs(it.second.upper - want) }, { -it.first.size }))
+            for ((useCases, chosen) in options) {
+                val withStream = analysis in useCases
+                if (rebind(if (withStream) analysis else null, null) {
+                        provider.bindToLifecycle(this, selector, SessionConfig(useCases = useCases, frameRateRange = chosen))
+                    }
+                ) {
+                    recorder = r
+                    video = v
+                    rate = chosen
+                    liveStream = withStream
+                    break
+                }
+            }
+            if (recorder == null && rebind(analysis, null) { provider.bindToLifecycle(this, selector, preview, analysis, v) }) {
+                recorder = r // the phone picks the frame rate
+                video = v
+            }
+        }
+
+        if (recorder == null || video == null) {
+            recordingToken = null
+            bindUseCases()
+            link.sendError(req, "couldn't set up video recording on this phone")
+            return
+        }
+        if (rate != null && rate.upper < fps && notes.length() == 0) notes.put("${rate.upper} fps is the fastest this phone records at this setting")
+        if (!liveStream) notes.put("the live stream pauses during this recording; it comes back when the recording stops")
+
+        val file = File(cacheDir, "rec-$token.mp4")
+        val output = FileOutputOptions.Builder(file).setDurationLimitMillis((maxSeconds * 1000).toLong() + 5_000).build()
+        val v = video
+        var replied = false
+        activeRecording = recorder.prepareRecording(this, output).start(ContextCompat.getMainExecutor(this)) { event ->
+            when (event) {
+                is VideoRecordEvent.Start -> {
+                    recordingStartedAt = SystemClock.elapsedRealtime()
+                    val res = v.resolutionInfo
+                    var w = res?.resolution?.width ?: 0
+                    var h = res?.resolution?.height ?: 0
+                    if (res != null && res.rotationDegrees % 180 != 0) w = h.also { h = w }
+                    val started = JSONObject()
+                        .put("camera", chosenCamera.label)
+                        .put("fps", rate?.upper ?: 30)
+                        .put("width", w)
+                        .put("height", h)
+                        .put("high_speed", highSpeed)
+                        .put("live_stream", liveStream)
+                    recordingInfo = started
+                    link.sendJson(JSONObject(started.toString()).put("type", "result").put("req", req).put("ok", true).put("notes", notes))
+                    replied = true
+                    updateRecBadge()
+                }
+                is VideoRecordEvent.Status -> updateRecBadge()
+                is VideoRecordEvent.Finalize -> {
+                    activeRecording = null
+                    recordingInfo = null
+                    val usable = file.exists() && file.length() > 0 && event.error in setOf(
+                        VideoRecordEvent.Finalize.ERROR_NONE,
+                        VideoRecordEvent.Finalize.ERROR_DURATION_LIMIT_REACHED,
+                        VideoRecordEvent.Finalize.ERROR_FILE_SIZE_LIMIT_REACHED,
+                        VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE,
+                    )
+                    val why = event.cause?.message ?: "error ${event.error}"
+                    if (!replied) {
+                        link.sendError(req, "recording failed to start ($why)")
+                    } else if (usable) {
+                        sendRecording(file, token)
+                    } else {
+                        file.delete()
+                        link.sendJson(JSONObject().put("type", "record_error").put("token", token).put("error", why))
+                        showRecBadge("Recording failed: $why", hideAfterMs = 4000)
+                    }
+                    recordingToken = null
+                    bindUseCases() // back to the normal setup
+                }
+            }
+        }
+    }
+
+    /** The Camera2 high-speed mode closest to [fps]: (camera id, size, fps), preferring the main camera and [wanted] size. */
+    private fun pickCamera2HighSpeed(fps: Int, wanted: Quality): Triple<String, Size, Int>? {
+        val maxHeight = when (wanted) {
+            Quality.UHD -> 2160
+            Quality.FHD -> 1080
+            Quality.HD -> 720
+            else -> 480
+        }
+        val mainId = mainCamera()?.id
+        return camera2Fast.flatMap { (id, sizes) ->
+            sizes.mapNotNull { (size, rates) ->
+                val rate = rates.minByOrNull { abs(it - fps) * 2 + if (it > fps) 1 else 0 } ?: return@mapNotNull null
+                Triple(id, size, rate)
+            }
+        }.minWithOrNull(
+            compareBy<Triple<String, Size, Int>>(
+                { abs(it.third - fps) },
+                { if (minOf(it.second.width, it.second.height) <= maxHeight) 0 else 1 },
+                { if (it.first == mainId) 0 else 1 },
+                { -(it.second.width * it.second.height) },
+            ),
+        )
+    }
+
+    private fun startCamera2HighSpeed(req: String, token: String, id: String, size: Size, rate: Int, maxSeconds: Double, notes: JSONArray) {
+        val provider = cameraProvider ?: return
+        camera?.cameraInfo?.let { info ->
+            info.cameraState.removeObservers(this)
+            info.zoomState.removeObservers(this)
+            info.torchState.removeObservers(this)
+        }
+        provider.unbindAll() // Camera2 needs the camera to itself
+        imageAnalysis = null
+        imageCapture = null
+        val cam = backCameras.firstOrNull { it.id == id }
+        val hint = (cam ?: mainCamera())?.info?.getSensorRotationDegrees(targetRotation) ?: 90
+        val hs = HighSpeedRecorder(this, id, rate, size, hint, File(cacheDir, "rec-$token.mp4"))
+        highSpeedRecorder = hs
+        showRecBadge("Starting a $rate fps clip…")
+        hs.start(
+            onStarted = {
+                main.post {
+                    recordingStartedAt = SystemClock.elapsedRealtime()
+                    var w = size.width
+                    var h = size.height
+                    if (hint % 180 != 0) w = h.also { h = w }
+                    val started = JSONObject()
+                        .put("camera", (cam?.label ?: "camera $id") + ", Camera2 high-speed")
+                        .put("fps", rate)
+                        .put("width", w)
+                        .put("height", h)
+                        .put("high_speed", true)
+                        .put("live_stream", false)
+                    recordingInfo = started
+                    notes.put("the preview and live stream pause during a high-speed clip and come back when it stops")
+                    link.sendJson(JSONObject(started.toString()).put("type", "result").put("req", req).put("ok", true).put("notes", notes))
+                    updateRecBadge()
+                    main.postDelayed(highSpeedLimit, (maxSeconds * 1000).toLong() + 3_000)
+                }
+            },
+            onError = { message ->
+                main.post {
+                    if (highSpeedRecorder === hs) highSpeedRecorder = null
+                    hs.stop { }
+                    hs.file.delete()
+                    recordingToken = null
+                    bindUseCases()
+                    link.sendError(req, "high-speed recording failed: $message")
+                    showRecBadge("High-speed recording failed", hideAfterMs = 4000)
+                }
+            },
+        )
+    }
+
+    private fun finishHighSpeed() {
+        val hs = highSpeedRecorder ?: return
+        val token = recordingToken ?: return
+        highSpeedRecorder = null
+        main.removeCallbacks(highSpeedLimit)
+        showRecBadge("Finishing the clip…")
+        hs.stop { ok ->
+            main.post {
+                recordingInfo = null
+                if (ok) {
+                    sendRecording(hs.file, token)
+                } else {
+                    hs.file.delete()
+                    link.sendJson(JSONObject().put("type", "record_error").put("token", token).put("error", "the high-speed clip came out empty"))
+                    showRecBadge("Recording failed", hideAfterMs = 4000)
+                }
+                recordingToken = null
+                bindUseCases()
+            }
+        }
+    }
+
+    /** A video shared to Claude Cam from another app (e.g. Samsung's camera in Slow motion). */
+    private fun handleShare(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_SEND) return
+        val uri = if (Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra(Intent.EXTRA_STREAM)
+        } ?: return
+        setIntent(Intent()) // don't handle it again if the activity is recreated
+        val readable = try {
+            contentResolver.openInputStream(uri)?.close() != null
+        } catch (e: Exception) {
+            false
+        }
+        if (!readable) {
+            showRecBadge("Claude Cam wasn't allowed to read that video. Try sharing it from the Gallery.", hideAfterMs = 6000)
+            return
+        }
+        pendingImport = uri
+        if (link.isConnected) offerImport() else showRecBadge("Video ready to send; waiting for the computer…")
+    }
+
+    private fun shareInfo(uri: Uri): Pair<String, Long> {
+        var name = "video.mp4"
+        var size = -1L
+        try {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    if (!c.isNull(0)) name = c.getString(0)
+                    if (!c.isNull(1)) size = c.getLong(1)
+                }
+            }
+        } catch (e: Exception) {
+            // keep the defaults
+        }
+        return name to size
+    }
+
+    private fun offerImport() {
+        val uri = pendingImport ?: return
+        val (name, size) = shareInfo(uri)
+        link.sendJson(JSONObject().put("type", "import_offer").put("name", name).put("size", size))
+        showRecBadge("Sending $name to the computer…")
+    }
+
+    private fun sendImport(token: String) {
+        val uri = pendingImport ?: return
+        pendingImport = null
+        val (name, size) = shareInfo(uri)
+        showRecBadge("Sending $name to the computer… %.1f MB".format(size / 1e6))
+        link.uploadUri(uri, contentResolver, size, token) { ok, message ->
+            if (ok) showRecBadge("Video sent to Claude", hideAfterMs = 3000)
+            else showRecBadge("Couldn't send the video: $message", hideAfterMs = 6000)
+        }
+    }
+
+    private fun stopRecordingFromPhone() {
+        val token = recordingToken ?: return
+        if (activeRecording == null && highSpeedRecorder == null) return
+        link.sendJson(JSONObject().put("type", "record_stopped").put("token", token).put("by", "the user (tapped REC on the phone)"))
+        activeRecording?.stop()
+        finishHighSpeed()
+    }
+
+    private fun sendRecording(file: File, token: String) {
+        showRecBadge("Sending video to the computer… %.1f MB".format(file.length() / 1e6))
+        link.upload(file, token) { ok, message ->
+            file.delete()
+            if (ok) {
+                showRecBadge("Video saved on the computer", hideAfterMs = 2500)
+            } else {
+                link.sendJson(JSONObject().put("type", "record_error").put("token", token).put("error", "upload failed: $message"))
+                showRecBadge("Couldn't send the video: $message", hideAfterMs = 5000)
+            }
+        }
+    }
+
+    private val hideRecBadge = Runnable { recBadge.visibility = View.GONE }
+
+    private fun updateRecBadge() {
+        val info = recordingInfo ?: return
+        val secs = (SystemClock.elapsedRealtime() - recordingStartedAt) / 1000
+        showRecBadge("● REC %d:%02d · %d fps · tap to stop".format(secs / 60, secs % 60, info.optInt("fps")))
+    }
+
+    private fun showRecBadge(text: String, hideAfterMs: Long = 0) {
+        main.removeCallbacks(hideRecBadge)
+        recBadge.text = text
+        recBadge.visibility = View.VISIBLE
+        if (hideAfterMs > 0) main.postDelayed(hideRecBadge, hideAfterMs)
+    }
+
     // --- commands from the server ---------------------------------------------------------------
 
     override fun onCommand(cmd: JSONObject) {
@@ -438,6 +1019,15 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
             "message" -> showMessage(cmd)
             "clear_message" -> hideMessage()
             "activity" -> showActivity(cmd.optString("what"), cmd.optDouble("seconds", 0.0))
+            "record_start" -> startRecording(cmd)
+            "import_ready" -> sendImport(cmd.optString("token"))
+            "record_stop" -> {
+                if (cmd.optString("token") == recordingToken) {
+                    activeRecording?.stop()
+                    finishHighSpeed()
+                }
+                link.sendJson(JSONObject().put("type", "result").put("req", cmd.optString("req")).put("ok", true))
+            }
         }
     }
 
@@ -448,6 +1038,7 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
         val size = cmd.optInt("size", 1920).coerceIn(320, 1920)
         if (size != streamSize) {
             streamSize = size
+            // While recording, bindUseCases() waits; the new size applies when the recording ends.
             if (cameraProvider != null && hasCameraPermission()) bindUseCases()
         }
     }
@@ -588,7 +1179,10 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
         }
         statusText.text = text
         statusDot.backgroundTintList = ColorStateList.valueOf(ContextCompat.getColor(this, color))
-        if (state == CamLink.State.CONNECTED) sendStatus()
+        if (state == CamLink.State.CONNECTED) {
+            sendStatus()
+            if (pendingImport != null) offerImport()
+        }
         if (state != CamLink.State.CONNECTED) {
             statsText.text = if (state == CamLink.State.DISCONNECTED) detail else ""
         }
@@ -638,6 +1232,10 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
             },
         )
         o.put("fps_actual", fpsActual.toDouble())
+        videoCaps?.let { caps -> caps.keys().forEach { o.put(it, caps.get(it)) } }
+        recordingInfo?.let {
+            o.put("recording", JSONObject(it.toString()).put("seconds", (SystemClock.elapsedRealtime() - recordingStartedAt) / 1000.0))
+        }
         return o
     }
 
