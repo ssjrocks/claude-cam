@@ -17,3 +17,6 @@ android/.kotlin/
 
 # Built app
 dist/
+
+# Installer build output
+build/

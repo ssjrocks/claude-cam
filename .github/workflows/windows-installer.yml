@@ -1,0 +1,49 @@
+name: Windows installer
+
+# Builds ClaudeCamSetup.exe on Windows, tests it end to end, and attaches it to published releases.
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip pyinstaller pillow ./plugin/server
+
+      - name: Build ClaudeCamSetup.exe
+        run: python installer/build.py
+
+      - name: Test without a claude command (edits the settings file)
+        run: python installer/smoke_test.py dist/ClaudeCamSetup.exe
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Test with the claude command (and Claude Code's own health check)
+        run: python installer/smoke_test.py dist/ClaudeCamSetup.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeCamSetup
+          path: dist/ClaudeCamSetup.exe
+
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/ClaudeCamSetup.exe --clobber

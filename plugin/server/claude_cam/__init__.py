@@ -1,5 +1,4 @@
 """Claude Cam: let Claude see through your phone's camera."""
 
-from .server import VERSION as __version__
-
-__all__ = ["__version__"]
+# Kept here (not in server.py) so the Windows installer can read it without importing the server.
+__version__ = "1.2.0"

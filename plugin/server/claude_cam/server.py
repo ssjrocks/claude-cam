@@ -33,7 +33,7 @@ from urllib.parse import urlsplit
 from aiohttp import WSMsgType, web
 from PIL import Image, ImageFilter, ImageOps
 
-from . import video
+from . import __version__, video
 from .common import (
     SENSITIVITY,
     CamError,
@@ -49,7 +49,7 @@ from .common import (
     text_block,
 )
 
-VERSION = "1.1.0"
+VERSION = __version__
 SERVICE_TYPE = "_claudecam._tcp.local."
 PACKAGE_DIR = Path(__file__).resolve().parent
 STATIC = PACKAGE_DIR / "static"
@@ -1687,14 +1687,26 @@ async def serve(settings: Settings) -> None:
 
 
 def main() -> None:
+    frozen = getattr(sys, "frozen", False)
+    if frozen and sys.platform == "win32" and len(sys.argv) == 1:
+        # Someone double-clicked the program from the Windows installer; it runs inside Claude.
+        from .installer import message_box
+
+        message_box(
+            "Claude Cam runs inside Claude, so there's nothing to open here.\n\n"
+            "Open Claude, and open the Claude Cam app on your phone. "
+            "To remove Claude Cam, use Settings > Apps."
+        )
+        return
     p = argparse.ArgumentParser(prog="claude-cam", description="Let Claude see through your phone's camera.")
     p.add_argument(
         "mode",
         nargs="?",
-        choices=["serve", "stdio"],
+        choices=["serve", "stdio", "uninstall"],
         default="serve",
         help="serve: run as a service (Claude connects to http://127.0.0.1:PORT/mcp). "
-        "stdio: speak MCP on stdin/stdout, for Claude Code to start (default: serve)",
+        "stdio: speak MCP on stdin/stdout, for Claude Code to start. "
+        "uninstall: remove a Windows-installer setup (default: serve)",
     )
     p.add_argument("--host", default="0.0.0.0", help="address to listen on (default: all)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help="port for the phone and the API (default 8777, or $CLAUDE_CAM_PORT)")
@@ -1704,9 +1716,18 @@ def main() -> None:
     p.add_argument("--fps", type=float, default=3, help="idle stream frame rate")
     p.add_argument("--boost-fps", type=float, default=10, help="frame rate while Claude is watching")
     p.add_argument("--log-level", default="INFO")
+    p.add_argument("--yes", action="store_true", help="uninstall: don't ask or show messages")
+    p.add_argument("--no-firewall", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--no-registry", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args()
-    # stdout carries the MCP protocol in stdio mode, so logs always go to stderr.
-    logging.basicConfig(stream=sys.stderr, level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if args.mode == "uninstall":
+        from .installer import uninstall
+
+        sys.exit(uninstall(assume_yes=args.yes, firewall=not args.no_firewall, registry=not args.no_registry))
+    # stdout carries the MCP protocol in stdio mode, so logs always go to stderr. A windowed build
+    # started without one gets a log file instead.
+    stream = sys.stderr or open(Path.home() / ".claude-cam.log", "a", encoding="utf-8")  # noqa: SIM115
+    logging.basicConfig(stream=stream, level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
     settings = Settings(args.host, args.port, args.advertise_ip, not args.no_mdns, args.buffer_seconds, args.fps, args.boost_fps)
     try:
