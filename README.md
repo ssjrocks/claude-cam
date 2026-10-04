@@ -2,7 +2,8 @@
 
 **Let Claude see through your phone's camera.** Point your phone at the thing you're working on, like
 a circuit board, a little screen, a 3D printer or a TV, and Claude can look at it while it works,
-instead of asking you to describe what you see.
+instead of asking you to describe what you see. It can also **record video**, from high-speed clips
+up to 240 fps that it examines frame by frame to demo recordings for documentation.
 
 > Unofficial community project. Not made by or affiliated with Anthropic.
 
@@ -93,8 +94,26 @@ When you're working on something physical, just say so:
 
 > I've propped my phone up facing the board. Flash the firmware and check that the LED starts blinking.
 
-Claude may also suggest it on its own when it would help. The plugin includes a skill that tells
-Claude when the camera is useful.
+For things that move fast, or to make a recording:
+
+> Record 3 seconds at 240 fps while the GIF plays on the LCD, and tell me its real frame rate and whether any frames are black.
+
+> Start a recording, set up the dashboard, then stop and give me five stills for the docs.
+
+Claude may also suggest the camera on its own when it would help. The plugin includes a skill that
+tells Claude when the camera is useful and how to examine video properly.
+
+### Updating
+
+When a new version comes out:
+
+1. Update the plugin. From a terminal:
+   `claude plugin marketplace update claude-cam` then `claude plugin update claude-cam@claude-cam`.
+   (Or use the `/plugin` menu inside Claude Code.)
+2. **Restart all your Claude Code sessions.** The session that started first runs the camera server
+   and keeps the old version until it restarts.
+3. On your phone, download the new **claude-cam.apk** from the
+   [latest release](https://github.com/ssjrocks/claude-cam/releases/latest) and install it over the old one.
 
 ## Using the app
 
@@ -108,12 +127,82 @@ Claude when the camera is useful.
   vibrates, and you tap **Done** when you've done it.
 - **Prop the phone up** if Claude needs to watch for changes. A hand-held phone always looks like it's changing.
 - The camera only works **while the app is open on screen.** The screen stays on for you.
-- When Claude records, a red **REC** badge shows the time. Tap it to stop the recording. During a
-  high-speed clip the preview freezes for those few seconds; that's normal.
-- **Share → Claude Cam** sends any video from your gallery or camera app to Claude. For really fast
-  things Claude may ask you to film in your camera's own **Slow motion** mode and share it.
+- When Claude records, a red **REC** badge shows the time. Tap it to stop the recording.
+- **Share → Claude Cam** sends any video from your gallery or camera app to Claude.
 
 <br clear="right">
+
+## Recording video
+
+<img src="docs/images/rec-badge.jpg" alt="The app recording, with a red REC badge at the top saying REC 0:02, 30 fps, tap to stop" width="230" align="right">
+
+The live picture Claude normally sees runs at only a few frames per second. That's fine for reading
+a screen or checking an LED, but too slow for anything that moves quickly. For that, and for making
+recordings, Claude records real video on the phone. The video is sent to your computer and saved in
+`~/Videos/Claude Cam` (`~/Movies/Claude Cam` on macOS).
+
+### High-speed clips: seeing things too fast for the eye
+
+For animations, GIF playback, flicker, blinking LEDs, or a glitch that lasts one frame, Claude records a
+few seconds at 120 or 240 fps. It then measures **every frame**, so it isn't guessing from a few:
+
+- the real frame rate the phone delivered, and any frames it dropped;
+- which part of the picture is changing (say, a small screen) and the numbers for just that part;
+- runs of dark frames, with frame numbers;
+- how often the picture actually updates, e.g. "about 24 updates/s" for a 24 fps GIF;
+- a warning when the content changes faster than the recording, so Claude knows it's missing frames
+  instead of misreading them.
+
+It can then look at any stretch frame by frame, zoomed into the screen, and save frames as images.
+
+<br clear="right">
+
+![Twelve consecutive frames of a white line crossing a TV screen, 4.2 ms apart](docs/images/highspeed-240fps.jpg)
+
+*12 consecutive frames from a Galaxy S23 recording at 240 fps, 4.2 ms apart: a white line crossing a TV
+that's playing a 60 fps test video.*
+
+What Claude gets back, here from a test with a simulated screen playing a 24 fps animation with
+some blank frames:
+
+```
+2.00 s, 480 frames, 240.0 fps, 1280x720.
+Most of the change happens in one area, [0.212, 0.278, 0.575, 0.356] (20% of the frame). Measured on that area alone:
+  Dark frames: 40 in 4 run(s): #46-55 (10 frames, from 0.192 s), #166-175 (from 0.692 s), ...
+  Picture updates: 48 in 2.00 s, median interval 41.7 ms (about 24.0 updates/s).
+Contact sheet: 16 of 480 frames... It's only a sample: check frame ranges before drawing conclusions.
+```
+
+**Tips for good results:**
+- **Prop the phone up** so it doesn't move. Camera shake looks like change in every frame.
+- When Claude asks you to start the video or animation, start it and tap **Done**. Claude starts
+  recording right away.
+- During a high-speed clip the **preview on the phone freezes** for those few seconds. That's normal,
+  and it comes back afterwards.
+- If you can see the device, **tell Claude what it should look like**. Dark frames are often just the
+  content (an object off screen, a black background), not a fault.
+
+### Which phones can record high-speed
+
+| Phone | What you get |
+| --- | --- |
+| Phones that offer apps a high-speed mode through CameraX | Their high-speed rates, usually 120/240 fps |
+| Phones that offer it only through Android's lower-level Camera2 API, e.g. **Galaxy S23** (tested) | 120/240 fps at up to 1080p; Claude Cam records these directly with Camera2 |
+| Everything else | About 30 fps. Claude is warned when that's too slow, and can ask you to film in your camera app's **Slow motion** mode and share it |
+
+Ask Claude to "check the camera status" to see what your phone offers.
+
+### Demo and how-to recordings
+
+Ask Claude to record while it works. It starts a normal 30 fps recording, does the job, stops, and can
+pull out still frames for documentation. While it records, Claude can usually still see the live
+picture (it depends on the phone); full-size photos are paused until the recording stops. Recordings can run up to 10 minutes.
+
+### Videos from your camera app
+
+**Share → Claude Cam** works from your gallery or camera app. The app sends the video to your computer,
+and Claude analyses it the same way. Claude may ask you to do this for things only your phone's own
+camera app can capture, like **Slow motion**. If a clip is saved slowed down, Claude can account for that.
 
 ## What Claude can do
 
@@ -125,16 +214,8 @@ Claude when the camera is useful.
 | `camera_wait_for_change` | Waits until the picture changes (a screen updates, an LED turns on) and shows before/after |
 | `camera_control` | Flashlight, zoom, exposure (great for bright screens) and focus |
 | `camera_message` | Shows you a message on the phone and can wait for you to tap Done |
-| `camera_record_video` | Records a video: high-speed clips (120/240 fps) for fast things, or start/stop recordings for demos |
+| `camera_record_video` | Records a video: high-speed clips (120/240 fps) for fast things, start/stop recordings for demos, or asks you to share one from your camera app |
 | `camera_video_frames` | Goes through a recording frame by frame: brightness, dark frames and update rate per frame, zoomed-in frames, exported stills |
-
-Videos are saved on your computer in `~/Videos/Claude Cam` (`~/Movies/Claude Cam` on macOS).
-
-**High-speed recording** depends on the phone. The app uses whatever the phone offers apps:
-CameraX's high-speed mode, or Camera2's constrained high-speed mode, which is how a Galaxy S23 records
-240 fps at 1080p. `camera_status` shows what your phone can do. Phones without either are limited to
-about 30 fps. Claude is told when that's too slow for what it's looking at, and can ask you to use your
-camera app's Slow motion instead.
 
 ## Troubleshooting
 
@@ -157,6 +238,18 @@ Claude Code, and type `your-computer-ip:8787` in the app.
 **After updating, Claude says a camera tool isn't available or is "unknown"**
 Restart all your Claude Code sessions. The first session that started keeps running the old version
 of Claude Cam until it restarts.
+
+**Claude says my phone has no high-speed mode**
+Some phones don't let other apps record faster than 30 fps. Claude can ask you to film in your camera
+app's Slow motion mode and share the video to Claude Cam instead.
+
+**The preview froze**
+That happens during a high-speed clip; it comes back after a few seconds. If it stays frozen, close
+and reopen the app.
+
+**A shared video never reached Claude**
+The app has to be connected (Claude Code open, same Wi-Fi) to send it. Open Claude Cam, wait for
+**Connected**, and share the video again. Long or 4K videos take a while over Wi-Fi.
 
 **"Another phone took over"**
 Claude Cam talks to one phone at a time. Tap the status bar on the phone you want to use.
@@ -220,26 +313,43 @@ http://127.0.0.1:8777/live. Use this or the plugin, not both.
 
 ```mermaid
 flowchart LR
-    P["Claude Cam app<br/>(Android, CameraX)"] -- "Wi-Fi: live frames + photos<br/>WebSocket :8777" --> S["claude-cam server<br/>(on your computer)"]
+    P["Claude Cam app<br/>(Android: CameraX + Camera2)"] -- "live frames + photos<br/>WebSocket :8777" --> S["claude-cam server<br/>(on your computer)"]
+    P -- "recorded videos<br/>HTTP upload :8777" --> S
+    S -- "saves" --> V[("~/Videos/Claude Cam")]
     S -- "MCP tools<br/>(images + text)" --> C["Claude Code"]
-    C -- "camera_message, camera_control" --> S
-    S -- "messages, settings" --> P
+    C -- "record, message, control" --> S
+    S -- "commands, messages, settings" --> P
 ```
 
 Claude Code starts the server when it starts. The app finds it on your Wi-Fi with mDNS, or you type
-the address. The server keeps a short history of frames and detects changes in the picture. It hands
-images to Claude through [MCP](https://modelcontextprotocol.io) tools.
+the address. The server keeps a short history of live frames and detects changes in the picture.
+Recordings are made on the phone and uploaded when they finish. The server decodes them with
+[PyAV](https://github.com/PyAV-Org/PyAV) to measure every frame. It hands images and results to Claude
+through [MCP](https://modelcontextprotocol.io) tools.
 
 **[Read the full write-up: how and why Claude Cam was built →](docs/WRITEUP.md)**
 
 ## Building from source
 
 - **Server:** `cd plugin/server && uv run claude-cam serve` (or `stdio`). To test without a phone:
-  `uv run python -m claude_cam.fake_phone --url ws://127.0.0.1:8777/ws/device`.
+  `uv run python -m claude_cam.fake_phone --url ws://127.0.0.1:8777/ws/device --display-file display.txt`.
+  The fake phone shows the file's text on a pretend screen and can record. Put `GIF` in the text for a
+  24 fps animation, and `FLICKER` as well to blank every 12th frame of it.
+- **Settings:** `CLAUDE_CAM_PORT` (default 8777), `CLAUDE_CAM_RECORDINGS` (where videos are saved),
+  `CLAUDE_CAM_APK` (an APK to offer on the phone download page).
 - **App:** needs the Android SDK and JDK 17+. Run `scripts/build-apk.sh` to get `dist/claude-cam.apk`.
   Builds without `android/keystore.properties` are signed with your debug key.
 - **Layout:** `android/` holds the app (Kotlin). `plugin/` is the Claude Code plugin: the manifest,
   `.mcp.json`, the `phone-camera` skill, and the Python server in `plugin/server/`.
+
+## Changelog
+
+- **1.1.0:** video recording. High-speed clips (120/240 fps, including through Camera2 on phones such as
+  the Galaxy S23) with frame-by-frame analysis. Demo recordings with exported stills. Share → Claude Cam.
+  REC badge with tap to stop. The app keeps its chosen server through short network blips. Claude's
+  skill now covers examining video properly.
+- **1.0.0:** first release. Live view, photos, change detection, camera controls, messages on the
+  phone, Claude Code plugin with the `phone-camera` skill.
 
 ## License
 

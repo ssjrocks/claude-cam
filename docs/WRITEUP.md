@@ -1,7 +1,8 @@
 # Giving Claude eyes: how and why Claude Cam was built
 
-Claude Cam lets Claude see through a phone's camera. It's an Android app and a small server, and
-Claude uses it through MCP tools. This is the story of why it exists, how it's designed, and what we
+Claude Cam lets Claude see through a phone's camera, and since version 1.1, record and analyse video,
+including high-speed clips. It's an Android app and a small server, and Claude uses it through MCP
+tools. This is the story of why it exists, how it's designed, and what we
 learned building it.
 
 ## The problem: an agent that can't see its own results
@@ -42,9 +43,10 @@ display"*. From then on it could watch the device itself while it runs commands.
 
 ```mermaid
 flowchart LR
-    P["Phone app<br/>CameraX"] -- "WebSocket :8777<br/>JPEG frames + photos" --> S["claude-cam server<br/>Python, aiohttp"]
+    P["Phone app<br/>CameraX + Camera2"] -- "WebSocket :8777<br/>JPEG frames + photos" --> S["claude-cam server<br/>Python, aiohttp, PyAV"]
+    P -- "HTTP upload :8777<br/>finished MP4 recordings" --> S
     S -- "MCP: images + text" --> C["Claude Code"]
-    S -- "config, messages,<br/>'Claude is looking'" --> P
+    S -- "config, record start/stop, messages,<br/>'Claude is looking'" --> P
 ```
 
 **The phone connects to the computer, not the other way round.** Claude runs on the computer, phones
@@ -52,9 +54,12 @@ are bad at hosting servers (sleep, changing IPs, battery), and having the phone 
 doesn't matter what network tricks are between them. The server advertises itself over mDNS
 (`_claudecam._tcp`), so the app usually finds it without anyone typing an address.
 
-**One WebSocket carries everything.** The phone sends binary messages: a 4-byte header length, a small
-JSON header, then the JPEG. The server sends JSON commands back: stream settings, "take a photo",
-torch/zoom/focus, messages to show, and activity pings for the badge.
+**One WebSocket carries the live traffic.** The phone sends binary messages: a 4-byte header length, a
+small JSON header, then the JPEG. The server sends JSON commands back: stream settings, "take a
+photo", record start/stop, torch/zoom/focus, messages to show, and activity pings for the badge.
+Recordings are too big for that, so when one finishes, the phone POSTs the MP4 to `/upload/<token>`.
+The token is a one-time value the server handed out when it asked for the recording, so nothing else
+on the network can drop files into the recordings folder.
 
 **MCP is the interface to Claude.** MCP tool results can contain images, so a tool call hands Claude
 the actual picture with a text caption ("Photo 3060x4080 taken 16:33:17.0"). The server speaks MCP in
@@ -71,11 +76,12 @@ two ways:
 The most interesting decisions were about what the tools should be. A camera API for humans would
 be "start stream, take photo". An agent needs something different.
 
-**Two kinds of images.** `camera_frames` reads the live stream: instant, about 1440x1080, at 3 fps
+**Three kinds of images.** `camera_frames` reads the live stream: instant, about 1440x1080, at 3 fps
 (10 fps while Claude is actively watching). `camera_snapshot` takes a real full-resolution photo,
 about 12 MP on a modern phone, and can crop it. That way Claude can read a tiny serial number without
-pulling 12 MP images all the time. Images cost tokens, so the default sizes are moderate and every
-tool takes a `max_size`.
+pulling 12 MP images all the time. And `camera_record_video` records real video, up to 240 fps, for
+anything faster than the stream (see version 1.1 below). Images cost tokens, so the default sizes are
+moderate and every tool takes a `max_size`.
 
 **A 90-second memory.** The server keeps the last ~90 seconds of the stream. Claude can ask for "4 frames
 from the last 6 seconds" after a command has already run, and see a boot animation it would
@@ -198,7 +204,13 @@ something different: the main camera advertises *constrained high-speed video* a
 just lacks the encoder profiles CameraX looks for. So the app now records high-speed clips directly with
 Camera2 and MediaRecorder when CameraX can't, and the S23 delivers real 240 fps at 1080p. As a further
 fallback, Claude can ask the user to film with the phone's own camera app (Samsung's Slow motion) and
-share the video to Claude Cam, which uploads it for the same analysis.
+share the video to Claude Cam, which uploads it for the same analysis. So far that path has been tested
+by sharing from the emulator's Files app; real Samsung slow-motion files are still to be tried.
+
+![Twelve consecutive frames of a white line crossing a TV screen, 4.2 ms apart](images/highspeed-240fps.jpg)
+
+*Twelve consecutive frames from the S23 at 240 fps, 4.2 ms apart: a white line crossing a TV that's
+playing a 60 fps test video.*
 
 **Measure every frame; don't eyeball samples.** The analysis decodes the clip with PyAV and records
 each frame's brightness and how much it changed from the previous frame. From that it reports:
