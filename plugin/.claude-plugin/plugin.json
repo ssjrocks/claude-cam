@@ -1,7 +1,7 @@
 {
   "name": "claude-cam",
   "description": "Let Claude see through your phone's camera. Point your phone at a device and Claude can check screens, LEDs and hardware itself while it works, including high-speed video it examines frame by frame.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": { "name": "ssjrocks" },
   "homepage": "https://github.com/ssjrocks/claude-cam",
   "repository": "https://github.com/ssjrocks/claude-cam",

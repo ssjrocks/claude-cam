@@ -35,9 +35,26 @@ up to 240 fps that it examines frame by frame to demo recordings for documentati
 - A **computer with [Claude Code](https://claude.com/claude-code)** (Windows, macOS or Linux)
 - Both on the **same Wi-Fi network**
 
-## Setup (about 5 minutes)
+## Setup
 
-### 1. Install uv
+### Windows: one download (about a minute)
+
+1. Download **[ClaudeCamSetup.exe](https://github.com/ssjrocks/claude-cam/releases/latest/download/ClaudeCamSetup.exe)**
+   and open it. If Windows says *"Windows protected your PC"*, click **More info → Run anyway**. It
+   says that because the program isn't code-signed yet.
+2. When Windows asks whether Claude Cam may make changes, click **Yes**. That lets your phone reach
+   your PC through the firewall.
+3. **Quit Claude completely** (check the system tray by the clock) and open it again.
+4. **On your phone:** scan the QR code on the page that opens, install the app, open it and allow the camera.
+
+That's it. It works with the Claude desktop app and with Claude Code in a terminal. To remove it,
+use **Settings → Apps → Claude Cam → Uninstall**.
+
+### macOS, Linux, or Claude Code in a terminal
+
+These steps install the Claude Code plugin. It works on Windows too, if you'd rather do that.
+
+#### 1. Install uv
 
 Claude Cam's computer side is a small Python program. [uv](https://docs.astral.sh/uv/) runs it and
 downloads Python for you, so you don't need to install Python yourself.
@@ -56,7 +73,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 Then **close and reopen** your terminal, and Claude Code if it was open.
 
-### 2. Add Claude Cam to Claude Code
+#### 2. Add Claude Cam to Claude Code
 
 In Claude Code, type these two commands, one at a time:
 
@@ -72,7 +89,7 @@ The first start takes up to a minute while uv downloads what it needs. On **Wind
 window may ask whether to let Python use the network. Allow it on **private networks**, since that's
 how your phone reaches your computer. On **macOS**, click **Allow** if asked about incoming connections.
 
-### 3. Install the app on your phone
+#### 3. Install the app on your phone
 
 <img src="docs/images/qr-apk.png" alt="QR code linking to the Claude Cam app download" width="140" align="right">
 
@@ -83,7 +100,7 @@ how your phone reaches your computer. On **macOS**, click **Allow** if asked abo
    warning because the app isn't from the Play Store. The code is all here if you'd rather build it yourself.
 4. Open **Claude Cam** and allow camera access.
 
-### 4. Try it
+### Try it
 
 With Claude Code open, the app's top bar turns green and says **Connected**. Point the phone at
 something and ask Claude:
@@ -105,7 +122,9 @@ tells Claude when the camera is useful and how to examine video properly.
 
 ### Updating
 
-When a new version comes out:
+**Windows installer:** download and run the new **ClaudeCamSetup.exe**, then restart Claude.
+
+**Plugin:** when a new version comes out:
 
 1. Update the plugin. From a terminal:
    `claude plugin marketplace update claude-cam` then `claude plugin update claude-cam@claude-cam`.
@@ -218,6 +237,12 @@ camera app can capture, like **Slow motion**. If a clip is saved slowed down, Cl
 | `camera_video_frames` | Goes through a recording frame by frame: brightness, dark frames and update rate per frame, zoomed-in frames, exported stills |
 
 ## Troubleshooting
+
+**Windows setup says "Claude Cam is in use"**
+Quit Claude completely (right-click its icon in the system tray, then **Quit**) and run the setup again.
+
+**Windows setup says Claude isn't installed**
+Install the [Claude desktop app](https://claude.com/download) (or Claude Code), open it once, then run the setup again.
 
 **The app keeps saying "Looking for the Claude Cam server…"**
 - Claude Code has to be open (the plugin runs while Claude Code runs).
@@ -337,6 +362,10 @@ through [MCP](https://modelcontextprotocol.io) tools.
   24 fps animation, and `FLICKER` as well to blank every 12th frame of it.
 - **Settings:** `CLAUDE_CAM_PORT` (default 8777), `CLAUDE_CAM_RECORDINGS` (where videos are saved),
   `CLAUDE_CAM_APK` (an APK to offer on the phone download page).
+- **Windows installer:** on Windows, run `pip install pyinstaller pillow ./plugin/server`, then
+  `python installer/build.py`, to get `dist/ClaudeCamSetup.exe`. Run
+  `python installer/smoke_test.py dist/ClaudeCamSetup.exe` to test it end to end. GitHub Actions does
+  both on every release.
 - **App:** needs the Android SDK and JDK 17+. Run `scripts/build-apk.sh` to get `dist/claude-cam.apk`.
   Builds without `android/keystore.properties` are signed with your debug key.
 - **Layout:** `android/` holds the app (Kotlin). `plugin/` is the Claude Code plugin: the manifest,
@@ -344,6 +373,9 @@ through [MCP](https://modelcontextprotocol.io) tools.
 
 ## Changelog
 
+- **1.2.0:** one-click Windows installer (`ClaudeCamSetup.exe`). It bundles everything (no Python,
+  uv or Git needed), registers Claude Cam with Claude, adds the phone-camera skill, sets up the
+  firewall and shows the phone setup page. Uninstall from Settings → Apps. Now licensed under AGPL-3.0.
 - **1.1.0:** video recording. High-speed clips (120/240 fps, including through Camera2 on phones such as
   the Galaxy S23) with frame-by-frame analysis. Demo recordings with exported stills. Share → Claude Cam.
   REC badge with tap to stop. The app keeps its chosen server through short network blips. Claude's
