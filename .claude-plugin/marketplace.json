@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-cam",
+  "description": "Claude Cam: let Claude see through your phone's camera.",
+  "owner": { "name": "ssjrocks" },
+  "plugins": [
+    {
+      "name": "claude-cam",
+      "description": "Let Claude see through your phone's camera. Point your phone at a device and Claude can check screens, LEDs and hardware itself while it works.",
+      "version": "1.0.0",
+      "author": { "name": "ssjrocks" },
+      "source": "./plugin",
+      "category": "productivity",
+      "homepage": "https://github.com/ssjrocks/claude-cam"
+    }
+  ]
+}

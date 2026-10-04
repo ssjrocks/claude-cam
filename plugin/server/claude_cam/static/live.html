@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Cam Live</title>
+<style>
+  :root { color-scheme: dark; --bg: #141413; --fg: #f0eee6; --muted: #a8a59b; --accent: #d97757; --card: #1f1e1c; --ok: #6fbf73; --bad: #e0614f; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, sans-serif; }
+  .wrap { display: grid; grid-template-columns: minmax(0, 1fr) 20rem; gap: 16px; padding: 16px; height: 100vh; }
+  @media (max-width: 52rem) { .wrap { grid-template-columns: 1fr; height: auto; } }
+  .view { background: #000; border-radius: 12px; display: grid; place-items: center; overflow: hidden; min-height: 240px; position: relative; }
+  .view img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .view .empty { color: var(--muted); position: absolute; }
+  aside { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .card { background: var(--card); border-radius: 12px; padding: 14px; }
+  h1 { font-size: 1.1rem; margin: 0 0 6px; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--bad); }
+  .dot.on { background: var(--ok); }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  button, input { font: inherit; border-radius: 8px; border: 1px solid #3a3935; background: #2b2a27; color: var(--fg); padding: 7px 10px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  input { flex: 1; min-width: 0; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="view"><span class="empty" id="empty">Waiting for the phone…</span><img id="img" alt="Live camera stream"></div>
+  <aside>
+    <div class="card">
+      <h1><span class="dot" id="dot"></span><span id="title">Claude Cam</span></h1>
+      <dl id="info"></dl>
+    </div>
+    <div class="card">
+      <div class="row">
+        <button id="torch">Torch</button>
+        <button id="photo">Full photo</button>
+        <button id="af">Autofocus</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="row">
+        <input id="msg" placeholder="Show a message on the phone">
+        <button id="send">Send</button>
+      </div>
+      <p class="muted" id="msgstate" style="margin:8px 0 0"></p>
+    </div>
+    <p class="muted">This is what Claude sees. Claude reads it through the MCP endpoint at <code>/mcp</code>.</p>
+  </aside>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let status = {};
+let streaming = false;
+
+function startStream() {
+  if (streaming) return;
+  streaming = true;
+  $("img").src = "/stream.mjpg?" + Date.now();
+}
+$("img").addEventListener("load", () => { $("empty").hidden = true; });
+$("img").addEventListener("error", () => { streaming = false; });
+
+async function post(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  return r.json();
+}
+
+async function refresh() {
+  try {
+    status = await (await fetch("/api/status")).json();
+  } catch { return; }
+  const d = status.device || {};
+  $("dot").classList.toggle("on", status.connected);
+  $("title").textContent = status.connected ? d.name : "No phone connected";
+  const rows = [];
+  if (status.connected) {
+    if (d.battery != null) rows.push(["Battery", d.battery + "%" + (d.charging ? " (charging)" : "")]);
+    if (status.stream_resolution) rows.push(["Stream", status.stream_resolution.join("×") + " · " + status.fps_measured + " fps"]);
+    if (status.last_frame_age != null) rows.push(["Last frame", status.last_frame_age.toFixed(1) + " s ago"]);
+    if (d.zoom != null) rows.push(["Zoom", d.zoom.toFixed(1) + "×"]);
+    if (d.torch != null) rows.push(["Torch", d.torch ? "on" : "off"]);
+    if (d.focus) rows.push(["Focus", d.focus]);
+    rows.push(["From", d.remote]);
+    startStream();
+  } else {
+    rows.push(["Phone URL", status.lan_url]);
+    if (status.last_device) rows.push(["Last phone", status.last_device.name + ", " + status.last_device.disconnected_ago + " s ago"]);
+  }
+  $("info").replaceChildren(...rows.flatMap(([k, v]) => {
+    const dt = document.createElement("dt"); dt.textContent = k;
+    const dd = document.createElement("dd"); dd.textContent = v;
+    return [dt, dd];
+  }));
+  $("msgstate").textContent = status.message ? "On screen: " + status.message : "";
+}
+
+$("torch").onclick = () => post("/api/control", { torch: !(status.device && status.device.torch) }).then(refresh);
+$("af").onclick = () => post("/api/control", { focus: "auto" }).then(refresh);
+$("photo").onclick = () => window.open("/api/photo.jpg?max=4000&t=" + Date.now(), "_blank");
+$("send").onclick = () => { post("/api/message", { text: $("msg").value }).then(refresh); $("msg").value = ""; };
+$("msg").addEventListener("keydown", (e) => { if (e.key === "Enter") $("send").click(); });
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+{
+  "name": "claude-cam",
+  "description": "Let Claude see through your phone's camera. Point your phone at a device and Claude can check screens, LEDs and hardware itself while it works.",
+  "version": "1.0.0",
+  "author": { "name": "ssjrocks" },
+  "homepage": "https://github.com/ssjrocks/claude-cam",
+  "repository": "https://github.com/ssjrocks/claude-cam",
+  "license": "MIT",
+  "keywords": ["camera", "vision", "hardware", "android", "mcp"]
+}
