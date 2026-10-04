@@ -3,7 +3,7 @@ name = "claude-cam"
 version = "1.1.0"
 description = "Let Claude see through your phone's camera: an MCP server for the Claude Cam Android app"
 readme = "README.md"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 requires-python = ">=3.12"
 authors = [{ name = "ssjrocks" }]
 keywords = ["claude", "mcp", "camera", "android", "claude-code"]

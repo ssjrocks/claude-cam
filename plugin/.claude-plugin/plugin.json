@@ -5,6 +5,6 @@
   "author": { "name": "ssjrocks" },
   "homepage": "https://github.com/ssjrocks/claude-cam",
   "repository": "https://github.com/ssjrocks/claude-cam",
-  "license": "MIT",
+  "license": "AGPL-3.0-or-later",
   "keywords": ["camera", "vision", "hardware", "android", "mcp"]
 }

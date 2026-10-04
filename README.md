@@ -353,5 +353,11 @@ through [MCP](https://modelcontextprotocol.io) tools.
 
 ## License
 
-[MIT](LICENSE). The idea came from [@ssjrocks](https://github.com/ssjrocks), and it was built
+Copyright © 2026 ssjrocks. Licensed under the [GNU AGPL-3.0](LICENSE) (version 3 or any later version).
+You can use, change and share Claude Cam
+freely. If you distribute a modified version, or run one as a service other people use over a
+network, you must make your source code available under the same license. Releases up to 1.1.0 were
+published under MIT.
+
+The idea came from [@ssjrocks](https://github.com/ssjrocks), and it was built
 together with Claude in Claude Code.
