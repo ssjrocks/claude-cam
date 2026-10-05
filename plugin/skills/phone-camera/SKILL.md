@@ -1,6 +1,6 @@
 ---
 name: phone-camera
-description: See the physical world through the user's phone camera (Claude Cam). Use when the result of your work shows up somewhere software can't read - hardware, microcontrollers (ESP32, Arduino, Raspberry Pi), ESPHome/IoT devices, LEDs, LCD/OLED/e-ink displays, 3D printers, robots and motors, TVs, monitors, kiosks, another device's screen, wiring, labels and serial numbers - or when the user would otherwise have to describe what they see. Covers checking whether the camera is available, asking the user to point their phone, verifying a command's visible effect, reading small text, watching for changes, recording high-speed clips of fast things (animations, GIFs, flicker, glitches) and examining them frame by frame, and recording demo videos.
+description: See the physical world through the user's phone camera (Claude Cam). Use when the result of your work shows up somewhere software can't read - hardware, microcontrollers (ESP32, Arduino, Raspberry Pi), ESPHome/IoT devices, LEDs, LCD/OLED/e-ink displays, 3D printers, robots and motors, TVs, monitors, kiosks, another device's screen, wiring, labels and serial numbers - or when the user would otherwise have to describe what they see. Covers checking whether the camera is available, asking the user to point their phone, verifying a command's visible effect, reading small text, watching for changes, recording high-speed clips of fast things (animations, GIFs, flicker, glitches) and examining them frame by frame, and recording demo videos. Always ask the user to open the app and wait for them to confirm before using the camera, and tell them straight away if a camera tool fails.
 ---
 
 # Seeing the real world with Claude Cam
@@ -8,6 +8,14 @@ description: See the physical world through the user's phone camera (Claude Cam)
 Claude Cam streams the user's phone camera to you through the `claude-cam` MCP server. The user
 points their phone at a device, and you can look at it yourself while you work, instead of asking
 "what does the screen say now?".
+
+**The two rules that matter most:**
+1. **Ask before you use the camera, then wait.** Say in chat what you want to look at and why, ask the
+   user to open the app and point the phone, and end your turn until they say it's ready.
+2. **Never fail silently.** If a camera tool fails, tell the user in your very next message. Don't
+   keep retrying, and don't carry on as if you'd seen the result.
+
+Details below.
 
 Tools (they may be listed as deferred: load them first, e.g. search for "camera"):
 
@@ -32,14 +40,45 @@ board, I can check the LEDs myself after each flash."
 Don't look when it isn't relevant to the task. The phone shows the user a "Claude is looking" badge
 whenever you read the camera.
 
-## Getting started
+## Before you use the camera: tell the user and wait
 
-1. Call `camera_status`.
-2. If no phone is connected, ask the user in chat to open the Claude Cam app and point it at the
-   device. (You can't reach the phone until the app is open.) Suggest propping it up if you'll be
-   watching for changes or recording.
-3. Call `camera_frames` to confirm the device is in view and readable. If it isn't, guide the user with
-   `camera_message`, e.g. "Move a bit closer to the screen", with `wait_for_done_seconds: 60`.
+The user can't see your tool calls as they happen. If you quietly try the camera and it isn't ready,
+they only find out much later, by reading the transcript. So:
+
+1. **Ask in chat first, then stop.** Before your first camera call in a task, tell the user what you
+   want to look at and why, and ask them to open Claude Cam and point the phone at it. Ask them to
+   prop it up if you'll watch for changes or record. Then **end your turn** and wait for their reply.
+   Don't call camera tools meanwhile, and don't start the part of the work that needs the camera.
+   For example:
+
+   > I'd like to watch the LCD while I flash the firmware, so I can check it myself. Could you open
+   > Claude Cam on your phone, prop it up facing the display, and tell me when its top bar says Connected?
+
+2. **When they say it's ready, check once.** Call `camera_status`. If a phone is connected, take one
+   look with `camera_frames` to confirm the device is in view and readable. If it isn't framed well,
+   say so in chat, or use `camera_message` ("Move a bit closer to the screen", with
+   `wait_for_done_seconds: 60`).
+3. **If it isn't connected, tell them and wait again.** Quote what `camera_status` said, suggest the
+   likely fix (the app is closed, a different Wi-Fi, Claude was restarted and the app hasn't reconnected
+   yet), and end your turn. Don't poll `camera_status` in a loop.
+4. **The only exception:** if the user has just said the phone is set up and pointed ("I've propped my
+   phone up facing the board"), go straight to step 2.
+
+Ask again (briefly) whenever you need the phone pointed somewhere new, or after a long gap.
+
+## Never fail silently
+
+- **If any camera tool fails,** stop and tell the user in your next message. Failures include no phone
+  connected, the phone not answering, a stalled stream, a recording or upload error, or a timeout. Say
+  what you were trying to do, what went wrong (quote the message), and what they can do about it.
+  Then wait for them. At most one quick retry before telling them, never a loop.
+- **Don't guess what the device showed.** If you couldn't see it, say "I couldn't check the display
+  because the camera wasn't connected", not a guess presented as an observation.
+- **Make every camera use visible in your reply.** Say briefly what you looked at or recorded, and what
+  you saw ("I recorded 3 s at 240 fps; the LED blinks about every 0.5 s"). The user shouldn't need to
+  read your tool calls to find out what happened.
+- **Ending your turn to wait for the user is the right move** when the camera isn't ready. Carrying on
+  without it, or retrying in silence, isn't.
 
 ## Rules: evidence before conclusions
 

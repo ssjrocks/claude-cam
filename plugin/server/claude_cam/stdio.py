@@ -80,7 +80,10 @@ class Bridge:
             # The host went away mid-call: take over and answer from here.
             if await self.ensure():
                 return await self.server.tools.call(name, args)
-            raise CamError("Lost the connection to the Claude Cam server; try again.") from None
+            raise CamError(
+                "Lost the connection to the Claude Cam server. Tell the user in your reply; it usually "
+                "recovers within a few seconds."
+            ) from None
         if result.get("isError"):
             text = " ".join(c.get("text", "") for c in result["content"] if c.get("type") == "text")
             if text.startswith("Unknown tool") and self.peer_version != VERSION:

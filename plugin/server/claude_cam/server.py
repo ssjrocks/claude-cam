@@ -122,6 +122,12 @@ class Recording:
     stop_timer: asyncio.TimerHandle | None = None
 
 
+TELL_USER = (
+    " Tell the user about this in your reply now, and wait for them; don't keep retrying "
+    "or carry on as if you'd seen the result."
+)
+
+
 class Device:
     def __init__(self, ws: web.WebSocketResponse, hello: dict, remote: str):
         self.ws = ws
@@ -166,9 +172,10 @@ class Hub:
 
     def not_connected_text(self) -> str:
         text = (
-            "No phone is connected to Claude Cam. Ask the user to open the Claude Cam app on their "
-            f"phone (on the same Wi-Fi as this PC; it finds {self.lan_url} by itself) and point the "
-            "camera at what you need to see, then try again."
+            "No phone is connected to Claude Cam. Stop and tell the user in your reply: ask them to open "
+            f"the Claude Cam app on their phone (on the same Wi-Fi as this PC; it finds {self.lan_url} by "
+            "itself) and point it at what you need to see, then end your turn and wait for them to say it's "
+            "connected. Don't poll for it."
         )
         if self.last_device:
             name, at = self.last_device
@@ -197,7 +204,7 @@ class Hub:
         log.info("phone disconnected: %s", dev.name)
         for fut in self.pending.values():
             if not fut.done():
-                fut.set_exception(CamError("The phone disconnected before it answered."))
+                fut.set_exception(CamError("The phone disconnected before it answered." + TELL_USER))
 
     def current_fps(self) -> float:
         return self.boost_fps if self.boosts else self.base_fps
@@ -241,7 +248,7 @@ class Hub:
             await dev.send({**msg, "req": rid})
             return await asyncio.wait_for(fut, timeout)
         except TimeoutError:
-            raise CamError(f"The phone did not answer within {timeout:g} s.") from None
+            raise CamError(f"The phone did not answer within {timeout:g} s." + TELL_USER) from None
         finally:
             self.pending.pop(rid, None)
 
@@ -249,7 +256,7 @@ class Hub:
         fut = self.pending.get(rid or "")
         if fut and not fut.done():
             if error:
-                fut.set_exception(CamError(f"The phone reported an error: {error}"))
+                fut.set_exception(CamError(f"The phone reported an error: {error}." + TELL_USER))
             else:
                 fut.set_result(value)
 
@@ -470,7 +477,7 @@ class Hub:
             if rec.stop_timer:
                 rec.stop_timer.cancel()
         elif data.get("type") == "record_error":
-            rec.done.set_exception(CamError(f"The phone couldn't record or send the video: {data.get('error')}"))
+            rec.done.set_exception(CamError(f"The phone couldn't record or send the video: {data.get('error')}." + TELL_USER))
 
     def offer_import(self, data: dict) -> str:
         """The user shared a video to Claude Cam; hand the phone a one-time upload token."""
@@ -509,8 +516,15 @@ Claude Cam lets you see live through the camera of the user's phone. Typical use
 points the phone at a device (a screen, LEDs, a dev board, a printer) while you run commands, \
 so you can check the physical result yourself instead of asking.
 
-- Start with camera_status. If no phone is connected, ask the user to open the Claude Cam app \
-and point it at the device; it finds this PC on the same Wi-Fi by itself.
+- Ask before you use the camera. Tell the user in chat what you want to look at and why, ask them \
+to open the Claude Cam app and point the phone at it, then end your turn and wait until they say \
+it's ready. Don't call camera tools before then. (If they've just said it's set up, go ahead.)
+- Then check once with camera_status. If no phone is connected, tell them what it said and wait \
+again; never poll in a loop.
+- Never fail silently. If a camera tool fails (no phone, no answer, stalled stream, recording or \
+upload error), tell the user in your very next message what you tried and what went wrong. Don't \
+retry repeatedly or carry on as if you'd seen the result. In every reply where you used the camera, \
+say what you looked at and what you saw: the user can't see your tool calls as they happen.
 - camera_frames is instant (frames from the live stream, also the last ~90 s of history). \
 camera_snapshot takes a full-resolution photo and can crop, which is best for reading small text.
 - To catch the effect of a command: get a timestamp first (`date +%s.%N`), run the command, then \
@@ -812,7 +826,8 @@ class Tools:
         if self.hub.device and latest and time.time() - latest.ts > 3:
             return (
                 f"\nWarning: the live stream has stalled (newest frame is {time.time() - latest.ts:.0f} s old). "
-                "The app may be in the background or the screen off."
+                "The app may be in the background or the screen off. Tell the user in your reply rather than "
+                "judging the device from old frames."
             )
         return ""
 
@@ -1092,7 +1107,7 @@ class Tools:
             await hub.show_message(text, 0, True)
             path = await asyncio.wait_for(fut, wait)
         except TimeoutError:
-            raise CamError(f"No video was shared to Claude Cam within {wait:g} s. The message is still on the phone.") from None
+            raise CamError(f"No video was shared to Claude Cam within {wait:g} s. The message is still on the phone." + TELL_USER) from None
         finally:
             hub.import_waiters.remove(fut)
         await hub.show_message("", 0, False)

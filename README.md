@@ -373,6 +373,8 @@ through [MCP](https://modelcontextprotocol.io) tools.
 
 ## Changelog
 
+- **1.2.1:** Claude now asks you before it uses the camera and waits for you to confirm the phone is
+  connected. If a camera tool fails, it tells you straight away instead of retrying quietly.
 - **1.2.0:** one-click Windows installer (`ClaudeCamSetup.exe`). It bundles everything (no Python,
   uv or Git needed), registers Claude Cam with Claude, adds the phone-camera skill, sets up the
   firewall and shows the phone setup page. Uninstall from Settings → Apps. Now licensed under AGPL-3.0.
