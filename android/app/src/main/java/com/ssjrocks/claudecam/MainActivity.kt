@@ -89,6 +89,9 @@ import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
+private const val USER_RECORDING = "user" // recordingToken while the user records their own video
+private const val RELEASES_URL = "https://github.com/ssjrocks/claude-cam/releases"
+
 class MainActivity : ComponentActivity(), CamLink.Listener {
 
     private lateinit var link: CamLink
@@ -98,6 +101,10 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
     private lateinit var statsText: TextView
     private lateinit var lookBadge: TextView
     private lateinit var recBadge: TextView
+    private lateinit var shutterButton: View
+    private lateinit var videoButton: ImageButton
+    private lateinit var capturesText: TextView
+    private lateinit var updateBanner: TextView
     private lateinit var torchButton: ImageButton
     private lateinit var zoomButton: TextView
     private lateinit var afButton: TextView
@@ -152,6 +159,15 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
     private var highSpeedRecorder: HighSpeedRecorder? = null // a Camera2 high-speed clip in progress
     private var camera2Fast: List<Pair<String, Map<Size, List<Int>>>> = emptyList()
     private val highSpeedLimit = Runnable { finishHighSpeed() }
+
+    // Photos and videos the user takes with the app's own buttons, held until Claude fetches them
+    private lateinit var captures: CaptureStore
+    private var userVideo: Recording? = null
+
+    // App updates from GitHub Releases
+    private lateinit var updates: UpdateChecker
+    private var availableUpdate: UpdateChecker.Update? = null
+    private var pendingInstall: File? = null
     private var tick = 0
 
     private val hideBadge = Runnable {
@@ -183,7 +199,18 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
         statsText = findViewById(R.id.stats_text)
         lookBadge = findViewById(R.id.look_badge)
         recBadge = findViewById(R.id.rec_badge)
-        recBadge.setOnClickListener { stopRecordingFromPhone() }
+        recBadge.setOnClickListener { if (userVideo != null) userVideo?.stop() else stopRecordingFromPhone() }
+        shutterButton = findViewById(R.id.shutter_button)
+        videoButton = findViewById(R.id.video_button)
+        capturesText = findViewById(R.id.captures_text)
+        updateBanner = findViewById(R.id.update_banner)
+        captures = CaptureStore(this)
+        captures.cleanTemporary()
+        updates = UpdateChecker(this)
+        shutterButton.setOnClickListener { takeUserPhoto() }
+        videoButton.setOnClickListener { toggleUserVideo() }
+        updateBanner.setOnClickListener { availableUpdate?.let { showUpdateDialog(it) } }
+        refreshCapturesUi()
         torchButton = findViewById(R.id.torch_button)
         zoomButton = findViewById(R.id.zoom_button)
         afButton = findViewById(R.id.af_button)
@@ -249,13 +276,25 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
         // Back from the settings page with the permission granted
         if (permissionView.visibility == View.VISIBLE && hasCameraPermission()) startCamera()
         link.start()
+        maybeCheckForUpdates()
         orientationListener.enable()
         main.post(ticker)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Back from "Install unknown apps" in Settings with permission now granted
+        val file = pendingInstall
+        if (file != null && (Build.VERSION.SDK_INT < 26 || packageManager.canRequestPackageInstalls())) {
+            pendingInstall = null
+            startActivity(updates.installIntent(file))
+        }
     }
 
     override fun onStop() {
         super.onStop()
         finishHighSpeed() // Android takes the camera away from background apps anyway
+        userVideo?.stop()
         link.stop()
         orientationListener.disable()
         main.removeCallbacks(ticker)
@@ -675,7 +714,7 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
             return
         }
         if (recordingToken != null) {
-            link.sendError(req, "already recording")
+            link.sendError(req, if (userVideo != null) "the user is recording a video on the phone right now" else "already recording")
             return
         }
         val info = chosenCamera.info
@@ -723,40 +762,12 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
         }
 
         if (recorder == null) {
-            val normal = Recorder.getVideoCapabilities(info).getSupportedQualities(DynamicRange.SDR)
-            val q = if (normal.isEmpty()) wanted else pickQuality(normal, wanted)
-            val r = Recorder.Builder()
-                .setQualitySelector(QualitySelector.from(q, FallbackStrategy.lowerQualityOrHigherThan(q)))
-                .build()
-            val v = VideoCapture.Builder(r).setTargetRotation(targetRotation).build()
-            val want = fps.coerceAtMost(60)
-            val preview = buildPreview()
-            val analysis = buildAnalysis()
-            // Keep the live stream unless dropping it gets a faster frame rate.
-            val options = listOf(listOf(preview, analysis, v), listOf(preview, v)).mapNotNull { useCases ->
-                val chosen = try {
-                    bestRange(info.getSupportedFrameRateRanges(SessionConfig(useCases = useCases)), want)
-                } catch (e: Exception) {
-                    null
-                }
-                chosen?.let { useCases to it }
-            }.sortedWith(compareBy({ abs(it.second.upper - want) }, { -it.first.size }))
-            for ((useCases, chosen) in options) {
-                val withStream = analysis in useCases
-                if (rebind(if (withStream) analysis else null, null) {
-                        provider.bindToLifecycle(this, selector, SessionConfig(useCases = useCases, frameRateRange = chosen))
-                    }
-                ) {
-                    recorder = r
-                    video = v
-                    rate = chosen
-                    liveStream = withStream
-                    break
-                }
-            }
-            if (recorder == null && rebind(analysis, null) { provider.bindToLifecycle(this, selector, preview, analysis, v) }) {
-                recorder = r // the phone picks the frame rate
-                video = v
+            val session = bindVideoSession(info, selector, wanted, fps)
+            if (session != null) {
+                recorder = session.recorder
+                video = session.video
+                rate = session.rate
+                liveStream = session.liveStream
             }
         }
 
@@ -818,6 +829,46 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
                 }
             }
         }
+    }
+
+    private class VideoSession(val recorder: Recorder, val video: VideoCapture<Recorder>, val rate: Range<Int>?, val liveStream: Boolean)
+
+    /**
+     * Binds preview + video (up to 60 fps) on [selector], keeping the live stream unless dropping it
+     * gets a faster frame rate. Null if the phone can't record at all.
+     */
+    private fun bindVideoSession(info: CameraInfo, selector: CameraSelector, wanted: Quality, fps: Int): VideoSession? {
+        val provider = cameraProvider ?: return null
+        val normal = Recorder.getVideoCapabilities(info).getSupportedQualities(DynamicRange.SDR)
+        val q = if (normal.isEmpty()) wanted else pickQuality(normal, wanted)
+        val r = Recorder.Builder()
+            .setQualitySelector(QualitySelector.from(q, FallbackStrategy.lowerQualityOrHigherThan(q)))
+            .build()
+        val v = VideoCapture.Builder(r).setTargetRotation(targetRotation).build()
+        val want = fps.coerceAtMost(60)
+        val preview = buildPreview()
+        val analysis = buildAnalysis()
+        val options = listOf(listOf(preview, analysis, v), listOf(preview, v)).mapNotNull { useCases ->
+            val chosen = try {
+                bestRange(info.getSupportedFrameRateRanges(SessionConfig(useCases = useCases)), want)
+            } catch (e: Exception) {
+                null
+            }
+            chosen?.let { useCases to it }
+        }.sortedWith(compareBy({ abs(it.second.upper - want) }, { -it.first.size }))
+        for ((useCases, chosen) in options) {
+            val withStream = analysis in useCases
+            if (rebind(if (withStream) analysis else null, null) {
+                    provider.bindToLifecycle(this, selector, SessionConfig(useCases = useCases, frameRateRange = chosen))
+                }
+            ) {
+                return VideoSession(r, v, chosen, withStream)
+            }
+        }
+        if (rebind(analysis, null) { provider.bindToLifecycle(this, selector, preview, analysis, v) }) {
+            return VideoSession(r, v, null, true) // the phone picks the frame rate
+        }
+        return null
     }
 
     /** The Camera2 high-speed mode closest to [fps]: (camera id, size, fps), preferring the main camera and [wanted] size. */
@@ -916,6 +967,207 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
         }
     }
 
+    // --- photos and videos the user takes for Claude ----------------------------------------------
+
+    private fun toast(text: String) = android.widget.Toast.makeText(this, text, android.widget.Toast.LENGTH_SHORT).show()
+
+    private fun refreshCapturesUi() {
+        val waiting = captures.describeWaiting()
+        capturesText.visibility = if (waiting.isEmpty()) View.GONE else View.VISIBLE
+        capturesText.text = "$waiting waiting for Claude · tell Claude you took ${if (captures.list().size == 1) "it" else "them"}"
+    }
+
+    private fun takeUserPhoto() {
+        val capture = imageCapture
+        if (capture == null) {
+            toast(if (recordingToken != null) "Wait for the recording to finish" else "The camera isn't ready yet")
+            return
+        }
+        val (_, file, tmp) = captures.newCapture("photo")
+        flashPreview()
+        capture.takePicture(ImageCapture.OutputFileOptions.Builder(tmp).build(), photoExecutor, object : ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                tmp.renameTo(file)
+                main.post {
+                    refreshCapturesUi()
+                    toast("Photo saved for Claude")
+                    sendStatus()
+                }
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                tmp.delete()
+                main.post { toast("Couldn't take the photo: ${exception.message}") }
+            }
+        })
+    }
+
+    private fun toggleUserVideo() {
+        userVideo?.let {
+            it.stop()
+            return
+        }
+        if (recordingToken != null) {
+            toast("Claude is recording right now")
+            return
+        }
+        val cam = mainCamera()
+        if (cameraProvider == null || cam == null) {
+            toast("The camera isn't ready yet")
+            return
+        }
+        recordingToken = USER_RECORDING
+        val session = bindVideoSession(cam.info, cam.selector, Quality.FHD, 30)
+        if (session == null) {
+            recordingToken = null
+            bindUseCases()
+            toast("This phone can't record video here")
+            return
+        }
+        val (_, file, tmp) = captures.newCapture("video")
+        userVideo = session.recorder.prepareRecording(this, FileOutputOptions.Builder(tmp).build())
+            .start(ContextCompat.getMainExecutor(this)) { event ->
+                when (event) {
+                    is VideoRecordEvent.Start -> {
+                        recordingStartedAt = SystemClock.elapsedRealtime()
+                        videoButton.setImageResource(R.drawable.ic_stop)
+                        updateRecBadge()
+                    }
+                    is VideoRecordEvent.Status -> updateRecBadge()
+                    is VideoRecordEvent.Finalize -> {
+                        userVideo = null
+                        videoButton.setImageResource(R.drawable.ic_record)
+                        val usable = tmp.length() > 0 && event.error in setOf(
+                            VideoRecordEvent.Finalize.ERROR_NONE,
+                            VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE,
+                        )
+                        if (usable) {
+                            tmp.renameTo(file)
+                            showRecBadge("Video saved for Claude", hideAfterMs = 2500)
+                        } else {
+                            tmp.delete()
+                            showRecBadge("The video couldn't be saved", hideAfterMs = 4000)
+                        }
+                        recordingToken = null
+                        bindUseCases()
+                        refreshCapturesUi()
+                        sendStatus()
+                    }
+                }
+            }
+    }
+
+    private fun capturesJson(): JSONArray = JSONArray(captures.list().map {
+        JSONObject().put("id", it.id).put("kind", it.kind).put("taken_at", it.takenAt).put("size", it.file.length())
+    })
+
+    /** The server wants one of the user's captures: upload it, then delete it from the phone. */
+    private fun sendCapture(id: String, token: String) {
+        val cap = captures.find(id)
+        if (cap == null) {
+            link.sendJson(JSONObject().put("type", "upload_failed").put("token", token).put("error", "it's no longer on the phone"))
+            return
+        }
+        showRecBadge("Sending your ${cap.kind} to Claude…")
+        link.upload(cap.file, token) { ok, message ->
+            if (ok) {
+                captures.delete(id)
+                showRecBadge("Sent to Claude", hideAfterMs = 2000)
+            } else {
+                link.sendJson(JSONObject().put("type", "upload_failed").put("token", token).put("error", message))
+                showRecBadge("Couldn't send it: $message", hideAfterMs = 5000)
+            }
+            refreshCapturesUi()
+            sendStatus()
+        }
+    }
+
+    // --- app updates ------------------------------------------------------------------------------
+
+    private fun maybeCheckForUpdates() {
+        val prefs = getSharedPreferences("claudecam", MODE_PRIVATE)
+        if (System.currentTimeMillis() - prefs.getLong("update_checked_at", 0) < 20 * 3600_000L) return
+        prefs.edit().putLong("update_checked_at", System.currentTimeMillis()).apply()
+        updates.check { update, _ -> if (update != null) offerUpdate(update) }
+    }
+
+    private fun offerUpdate(update: UpdateChecker.Update) {
+        availableUpdate = update
+        updateBanner.text = "Update available: Claude Cam ${update.versionName} · tap to see"
+        updateBanner.visibility = View.VISIBLE
+    }
+
+    private fun checkForUpdatesNow() {
+        toast("Checking GitHub for updates…")
+        updates.check { update, error ->
+            when {
+                update != null -> {
+                    offerUpdate(update)
+                    showUpdateDialog(update)
+                }
+                error != null -> AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle("Couldn't check for updates")
+                    .setMessage("$error\n\nCheck the phone is online, or see the releases page on GitHub.")
+                    .setPositiveButton("OK", null)
+                    .setNeutralButton("Open GitHub") { _, _ -> openUrl(RELEASES_URL) }
+                    .show()
+                else -> AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle("You're up to date")
+                    .setMessage("Claude Cam ${BuildConfig.VERSION_NAME} is the latest version on GitHub.")
+                    .setPositiveButton("OK", null)
+                    .show()
+            }
+        }
+    }
+
+    private fun showUpdateDialog(update: UpdateChecker.Update) {
+        val size = if (update.size > 0) " (%.1f MB)".format(update.size / 1e6) else ""
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Update to Claude Cam ${update.versionName}?")
+            .setMessage(
+                "Published by ${update.author} on GitHub, ${update.published}. You have ${BuildConfig.VERSION_NAME}.\n\n" +
+                    update.notes + "\n\n" +
+                    "It downloads$size from the official release on github.com and is checked against the release's " +
+                    "checksum. Android only installs it if it's signed by the same developer as the app you have now.",
+            )
+            .setPositiveButton("Update") { _, _ -> startUpdate(update) }
+            .setNeutralButton("View on GitHub") { _, _ -> openUrl(update.releaseUrl.ifBlank { RELEASES_URL }) }
+            .setNegativeButton("Later", null)
+            .show()
+    }
+
+    private fun startUpdate(update: UpdateChecker.Update) {
+        showRecBadge("Downloading the update… 0%")
+        updates.download(update, progress = { showRecBadge("Downloading the update… $it%") }) { file, error ->
+            if (file == null) {
+                showRecBadge("Update failed: $error", hideAfterMs = 6000)
+                return@download
+            }
+            showRecBadge("Update downloaded", hideAfterMs = 2000)
+            if (Build.VERSION.SDK_INT >= 26 && !packageManager.canRequestPackageInstalls()) {
+                pendingInstall = file
+                AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle("Allow updates")
+                    .setMessage("Android needs your OK once for Claude Cam to install its own updates. Turn on \"Allow from this source\", then come back.")
+                    .setPositiveButton("Open settings") { _, _ ->
+                        startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+                    }
+                    .setNegativeButton("Cancel") { _, _ -> pendingInstall = null }
+                    .show()
+            } else {
+                startActivity(updates.installIntent(file))
+            }
+        }
+    }
+
+    private fun openUrl(url: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (e: Exception) {
+            toast("No browser found")
+        }
+    }
+
     /** A video shared to Claude Cam from another app (e.g. Samsung's camera in Slow motion). */
     private fun handleShare(intent: Intent?) {
         if (intent?.action != Intent.ACTION_SEND) return
@@ -997,8 +1249,12 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
     private val hideRecBadge = Runnable { recBadge.visibility = View.GONE }
 
     private fun updateRecBadge() {
-        val info = recordingInfo ?: return
         val secs = (SystemClock.elapsedRealtime() - recordingStartedAt) / 1000
+        if (userVideo != null) {
+            showRecBadge("● Your video %d:%02d · tap to stop".format(secs / 60, secs % 60))
+            return
+        }
+        val info = recordingInfo ?: return
         showRecBadge("● REC %d:%02d · %d fps · tap to stop".format(secs / 60, secs % 60, info.optInt("fps")))
     }
 
@@ -1021,6 +1277,10 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
             "activity" -> showActivity(cmd.optString("what"), cmd.optDouble("seconds", 0.0))
             "record_start" -> startRecording(cmd)
             "import_ready" -> sendImport(cmd.optString("token"))
+            "captures_list" -> link.sendJson(
+                JSONObject().put("type", "result").put("req", cmd.optString("req")).put("ok", true).put("captures", capturesJson()),
+            )
+            "capture_send" -> sendCapture(cmd.optString("id"), cmd.optString("token"))
             "record_stop" -> {
                 if (cmd.optString("token") == recordingToken) {
                     activeRecording?.stop()
@@ -1232,6 +1492,7 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
             },
         )
         o.put("fps_actual", fpsActual.toDouble())
+        o.put("captures_waiting", captures.list().size)
         videoCaps?.let { caps -> caps.keys().forEach { o.put(it, caps.get(it)) } }
         recordingInfo?.let {
             o.put("recording", JSONObject(it.toString()).put("seconds", (SystemClock.elapsedRealtime() - recordingStartedAt) / 1000.0))
@@ -1331,12 +1592,19 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             isSingleLine = true
         }
+        val version = TextView(this).apply {
+            text = "Claude Cam ${BuildConfig.VERSION_NAME}"
+            setPadding(0, dp(12), 0, 0)
+            alpha = 0.7f
+        }
         layout.addView(info)
         layout.addView(input)
+        layout.addView(version)
         AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Claude Cam server")
             .setView(layout)
             .setPositiveButton("Connect") { _, _ -> link.setManualTarget(input.text.toString()) }
+            .setNeutralButton("Check for updates") { _, _ -> checkForUpdatesNow() }
             .setNegativeButton("Cancel", null)
             .show()
     }

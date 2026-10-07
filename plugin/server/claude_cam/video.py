@@ -30,6 +30,20 @@ def recordings_dir() -> Path:
     return base / "Claude Cam"
 
 
+def photos_dir() -> Path:
+    """Where photos the user takes in the app are saved (~/Pictures/Claude Cam)."""
+    if env := os.environ.get("CLAUDE_CAM_PHOTOS"):
+        return Path(env).expanduser()
+    return Path.home() / "Pictures" / "Claude Cam"
+
+
+def new_photo_path(name: str) -> Path:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")[:60] or "photo"
+    folder = photos_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{time.strftime('%Y-%m-%d_%H-%M-%S')}_{slug}.jpg"
+
+
 def new_recording_path(name: str, fps: int | None = None, suffix: str = ".mp4") -> Path:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")[:60] or "recording"
     folder = recordings_dir()

@@ -14,6 +14,9 @@ val keystoreProps = Properties().apply {
 // Optional server the app tries first (-Pclaudecam.server=host:port, see scripts/build-apk.sh).
 // The app also finds the server over mDNS, and the address can be changed in the app.
 val defaultServer = (findProperty("claudecam.server") as String?).orEmpty()
+// Where the app looks for updates: the latest GitHub release (override for testing).
+val updateApi = (findProperty("claudecam.updateApi") as String?)
+    ?: "https://api.github.com/repos/ssjrocks/claude-cam/releases/latest"
 
 android {
     namespace = "com.ssjrocks.claudecam"
@@ -23,9 +26,11 @@ android {
         applicationId = "com.ssjrocks.claudecam"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1.0"
+        // claudecam.versionCode/versionName only exist to test the in-app updater.
+        versionCode = (findProperty("claudecam.versionCode") as String?)?.toInt() ?: 3
+        versionName = (findProperty("claudecam.versionName") as String?) ?: "1.3.0"
         buildConfigField("String", "DEFAULT_SERVER", "\"$defaultServer\"")
+        buildConfigField("String", "UPDATE_API", "\"$updateApi\"")
     }
 
     buildFeatures {

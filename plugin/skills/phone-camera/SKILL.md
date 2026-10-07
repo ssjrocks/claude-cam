@@ -26,6 +26,7 @@ Tools (they may be listed as deferred: load them first, e.g. search for "camera"
 | `camera_snapshot` | Take a full-resolution photo; `crop` reads small text, and `use_last` re-crops it without a new photo |
 | `camera_wait_for_change` | Block until the picture changes and settles, then return before/after frames |
 | `camera_record_video` | Record an MP4: high-speed clips (120/240 fps) for fast things, or start/stop recordings for demos. `from_camera_app` asks the user to film with the phone's own camera app and share it in |
+| `camera_phone_captures` | Fetch the photos and videos the user took themselves with the app's shutter and record buttons |
 | `camera_video_frames` | Examine a recording frame by frame: per-frame statistics table, contact sheet or separate frames, crop, frame ranges, `save_dir` to export stills |
 | `camera_control` | Set torch, zoom, exposure (negative for bright screens), focus point, stream fps/size, rotation |
 | `camera_message` | Put text on the phone screen; with `wait_for_done_seconds` it waits for the user to tap Done |
@@ -176,6 +177,22 @@ Give the user frames to check themselves: `save_dir="~/Videos/Claude Cam/<clip>_
 `ffmpeg -i <clip>.mp4 -fps_mode passthrough -start_number 0 <dir>/frame_%04d.jpg`. The
 `passthrough` setting keeps file numbers equal to frame numbers; without it ffmpeg duplicates frames to
 fill timing gaps. Tell the user the folder and the frame numbers you're talking about.
+
+## Photos and videos the user takes
+
+The app has a shutter button (photo) and a record button (video) for the user. What they take stays
+in the app's private storage (never the phone's gallery) until you fetch it, then it's deleted from
+the phone.
+
+- **When the user says they've taken a photo or video for you,** call `camera_phone_captures`. Photos
+  come back as images; videos get the same analysis as `camera_record_video`, so examine them with
+  `camera_video_frames` the same careful way (rules above).
+- **`camera_status` tells you when some are waiting.** Mention it, or ask whether they're relevant,
+  rather than fetching silently in the middle of something else.
+- **Once fetched they're only on the computer:** photos in `~/Pictures/Claude Cam`, videos in
+  `~/Videos/Claude Cam`. Look there to see one again; calling the tool again only gets new ones.
+- **Asking the user to take one** is a good alternative to driving the camera yourself, when they can
+  frame the shot better by hand ("Could you take a close-up photo of the label with the white button?").
 
 ## Other patterns
 

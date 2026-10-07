@@ -72,10 +72,39 @@ async def run(url: str, display_file: Path) -> None:
             return {"type": "status", "battery": 77, "charging": True, "camera_ready": True, "zoom_min": 0.6, "zoom_max": 10.0,
                     "exposure_min": -8, "exposure_max": 8, "exposure_step": 0.25, "has_flash": True, "orientation": "portrait",
                     "video_fps": [30, 60], "video_qualities": ["720p", "1080p"], "high_speed_fps": [120, 240],
-                    "high_speed_qualities": ["720p"], **state}
+                    "high_speed_qualities": ["720p"], "captures_waiting": len(captures), **state}
 
         rec = {}
         base = url.replace("ws://", "http://").split("/ws/")[0]
+
+        # Captures the "user" took with the app's own buttons, held until the server fetches them.
+        def make_clip() -> bytes:
+            import av
+
+            path = Path(tempfile.mkdtemp()) / "capture.mp4"
+            with av.open(str(path), "w") as out:
+                stream = out.add_stream("libx264", rate=30)
+                stream.width, stream.height, stream.pix_fmt = 640, 480, "yuv420p"
+                for k in range(60):
+                    out.mux(stream.encode(av.VideoFrame.from_image(scene("GIF PHONE VIDEO", 640, 480, False, k / 30))))
+                out.mux(stream.encode(None))
+            return path.read_bytes()
+
+        now_ms = int(time.time() * 1000)
+        captures = {
+            "photo-1": {"kind": "photo", "taken_at": now_ms - 60_000, "data": jpeg(scene("USER PHOTO", 2000, 1500, False), 90)},
+            "video-1": {"kind": "video", "taken_at": now_ms - 30_000, "data": await asyncio.to_thread(make_clip)},
+        }
+
+        async def send_capture(cid: str, token: str) -> None:
+            cap = captures.get(cid)
+            if cap is None:
+                await ws.send_str(json.dumps({"type": "upload_failed", "token": token, "error": "no such capture"}))
+                return
+            async with session.post(f"{base}/upload/{token}", data=cap["data"]) as r:
+                print("capture upload ->", r.status)
+                if r.status == 200:
+                    captures.pop(cid, None)  # the app deletes it once Claude has it
 
         async def finish_recording(token: str, fps: int, size: tuple[int, int], t0: float, t1: float) -> None:
             import av  # only needed for recordings
@@ -129,6 +158,12 @@ async def run(url: str, display_file: Path) -> None:
                     if isinstance(state["focus"], list):
                         state["focus"] = f"locked at {state['focus']}"
                     await ws.send_str(json.dumps({"type": "result", "req": m["req"], "ok": True, "state": status()}))
+                elif t == "captures_list":
+                    items = [{"id": cid, "kind": c["kind"], "taken_at": c["taken_at"], "size": len(c["data"])}
+                             for cid, c in sorted(captures.items(), key=lambda kv: -kv[1]["taken_at"])]
+                    await ws.send_str(json.dumps({"type": "result", "req": m["req"], "ok": True, "captures": items}))
+                elif t == "capture_send":
+                    asyncio.create_task(send_capture(m.get("id"), m.get("token")))
                 elif t == "record_start":
                     fps = 240 if m["fps"] > 120 else (120 if m["fps"] > 60 else min(60, m["fps"]))
                     size = (1280, 720) if fps > 60 else ((1920, 1080) if m.get("quality") == "1080p" else (1280, 720))

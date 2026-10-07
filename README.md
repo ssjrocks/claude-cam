@@ -146,7 +146,14 @@ tells Claude when the camera is useful and how to examine video properly.
   vibrates, and you tap **Done** when you've done it.
 - **Prop the phone up** if Claude needs to watch for changes. A hand-held phone always looks like it's changing.
 - The camera only works **while the app is open on screen.** The screen stays on for you.
+- **Take a photo or video for Claude yourself:** the big white button takes a photo and the red
+  button records a video. They stay in the app (not in your gallery) until Claude collects them, and
+  then they're deleted from the phone. A note shows how many are waiting. Just tell Claude "I took a photo".
 - When Claude records, a red **REC** badge shows the time. Tap it to stop the recording.
+- **Updates:** the app checks the official GitHub releases once a day and shows a banner when there's
+  a new version. Tap the **gear → Check for updates** to look now. It shows who published the release
+  and when, checks the download against the release's checksum, and Android only installs it if it's
+  signed by the same developer as your current app.
 - **Share → Claude Cam** sends any video from your gallery or camera app to Claude.
 
 <br clear="right">
@@ -233,6 +240,7 @@ camera app can capture, like **Slow motion**. If a clip is saved slowed down, Cl
 | `camera_wait_for_change` | Waits until the picture changes (a screen updates, an LED turns on) and shows before/after |
 | `camera_control` | Flashlight, zoom, exposure (great for bright screens) and focus |
 | `camera_message` | Shows you a message on the phone and can wait for you to tap Done |
+| `camera_phone_captures` | Collects the photos and videos you took with the app's buttons |
 | `camera_record_video` | Records a video: high-speed clips (120/240 fps) for fast things, start/stop recordings for demos, or asks you to share one from your camera app |
 | `camera_video_frames` | Goes through a recording frame by frame: brightness, dark frames and update rate per frame, zoomed-in frames, exported stills |
 
@@ -285,9 +293,11 @@ Claude Cam talks to one phone at a time. Tap the status bar on the phone you wan
 ## Privacy and security
 
 - The camera streams **only while the app is open on screen**, and the badge shows you when Claude looks.
-- Live frames stay **on your computer**, in memory, for about 90 seconds. Videos are saved only when
-  Claude records one (the phone shows REC) or you share one to Claude Cam, and they stay in your
-  Videos folder. When Claude actually looks at a picture, that image becomes part of your
+- Live frames stay **on your computer**, in memory, for about 90 seconds. Videos and photos are saved
+  only when Claude records one (the phone shows REC), you share one to Claude Cam, or Claude collects
+  the ones you took with the app's buttons. Those are kept in the app's private storage (not your
+  gallery) until then. Saved files stay on your computer, in `Videos\Claude Cam` and
+  `Pictures\Claude Cam`. When Claude actually looks at a picture, that image becomes part of your
   conversation with Claude, like any image you paste in.
 - Your phone connects to your computer over your **local network** on port 8777. From the network,
   only that phone connection and a small download page are reachable. The pictures and controls
@@ -373,6 +383,10 @@ through [MCP](https://modelcontextprotocol.io) tools.
 
 ## Changelog
 
+- **1.3.0:** take photos and videos yourself with the app's shutter and record buttons. They're held
+  privately in the app (never the gallery) until Claude collects them with the new `camera_phone_captures`
+  tool, then deleted from the phone. The app also checks GitHub Releases for updates and installs
+  them, after verifying the checksum. App 1.3.0.
 - **1.2.1:** Claude now asks you before it uses the camera and waits for you to confirm the phone is
   connected. If a camera tool fails, it tells you straight away instead of retrying quietly.
 - **1.2.0:** one-click Windows installer (`ClaudeCamSetup.exe`). It bundles everything (no Python,

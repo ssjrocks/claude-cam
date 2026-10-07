@@ -173,10 +173,45 @@
                 android:textStyle="bold" />
         </LinearLayout>
 
+        <TextView
+            android:id="@+id/update_banner"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginBottom="10dp"
+            android:background="@drawable/badge"
+            android:paddingStart="14dp"
+            android:paddingTop="7dp"
+            android:paddingEnd="14dp"
+            android:paddingBottom="7dp"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp"
+            android:textStyle="bold"
+            android:visibility="gone"
+            tools:text="Update available: Claude Cam 1.3.0 · tap to see"
+            tools:visibility="visible" />
+
+        <TextView
+            android:id="@+id/captures_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginBottom="6dp"
+            android:background="@drawable/card"
+            android:paddingStart="12dp"
+            android:paddingTop="6dp"
+            android:paddingEnd="12dp"
+            android:paddingBottom="6dp"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp"
+            android:visibility="gone"
+            tools:text="2 photos waiting for Claude · tell Claude you took them"
+            tools:visibility="visible" />
+
         <LinearLayout
             android:id="@+id/controls"
             android:layout_width="match_parent"
-            android:layout_height="72dp"
+            android:layout_height="84dp"
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
@@ -209,6 +244,31 @@
                 android:layout_height="1dp"
                 android:layout_weight="1" />
 
+            <View
+                android:id="@+id/shutter_button"
+                android:layout_width="72dp"
+                android:layout_height="72dp"
+                android:background="@drawable/shutter_button"
+                android:contentDescription="Take a photo for Claude" />
+
+            <Space
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
+
+            <ImageButton
+                android:id="@+id/video_button"
+                android:layout_width="56dp"
+                android:layout_height="56dp"
+                android:background="@drawable/round_button"
+                android:contentDescription="Record a video for Claude"
+                android:src="@drawable/ic_record" />
+
+            <Space
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
+
             <TextView
                 android:id="@+id/af_button"
                 android:layout_width="56dp"
@@ -226,7 +286,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:gravity="center"
-            android:text="Tap to focus · pinch to zoom · what you see is what Claude sees"
+            android:text="Tap to focus · pinch to zoom · the white button takes a photo for Claude"
             android:textColor="#80FFFFFF"
             android:textSize="11sp" />
     </LinearLayout>

@@ -167,6 +167,8 @@ class Hub:
         self.recording: Recording | None = None
         self.imports: dict[str, str] = {}  # upload token -> file name, for videos shared from the phone
         self.import_waiters: list[asyncio.Future] = []
+        # Uploads the server asked for (photos/videos the user took in the app): token -> (path, future)
+        self.expected: dict[str, tuple[Path, asyncio.Future]] = {}
 
     # --- connection ---------------------------------------------------------------------------
 
@@ -486,6 +488,39 @@ class Hub:
         log.info("phone is sending a shared video: %s (%s bytes)", self.imports[token], data.get("size"))
         return token
 
+    # --- photos and videos the user took in the app --------------------------------------------
+
+    async def list_captures(self) -> list[dict]:
+        """What the app is holding for Claude, newest first. The app deletes each one once it's sent."""
+        result = await self.request({"type": "captures_list"}, timeout=15)
+        return list(result.get("captures") or [])
+
+    async def fetch_capture(self, cap: dict) -> Path:
+        """Have the phone upload one capture, and return where it was saved."""
+        self.require_device()
+        kind = cap.get("kind")
+        taken = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime((cap.get("taken_at") or 0) / 1000 or time.time()))
+        if kind == "photo":
+            path = video.new_photo_path(f"phone-photo-{taken}")
+        else:
+            path = video.new_recording_path(f"phone-video-{taken}")
+        token = uuid.uuid4().hex
+        fut = asyncio.get_running_loop().create_future()
+        self.expected[token] = (path, fut)
+        timeout = 60 + float(cap.get("size") or 0) / 1e6 * 3  # ~3 s per MB on slow Wi-Fi
+        try:
+            await self.device.send({"type": "capture_send", "id": cap.get("id"), "token": token})
+            return await asyncio.wait_for(fut, timeout)
+        except TimeoutError:
+            raise CamError(f"The phone didn't finish sending the {kind} within {timeout:.0f} s." + TELL_USER) from None
+        finally:
+            self.expected.pop(token, None)
+
+    def on_upload_failed(self, data: dict) -> None:
+        entry = self.expected.get(str(data.get("token")))
+        if entry and not entry[1].done():
+            entry[1].set_exception(CamError(f"The phone couldn't send it: {data.get('error')}." + TELL_USER))
+
     def on_import(self, path: Path) -> None:
         for fut in self.import_waiters:
             if not fut.done():
@@ -544,6 +579,8 @@ camera_video_frames (step=1, crop to the screen, table=true), and ask the user w
 look like: dark frames are usually content, not a fault. Don't invent hardware explanations.
 - camera_record_video also makes normal 30/60 fps recordings for demos or documentation: start it, \
 do the work, stop it. Videos are saved on this computer; camera_video_frames can export stills.
+- The user can take photos and videos themselves with the app's shutter and record buttons. When \
+they say they've taken one, fetch it with camera_phone_captures.
 - Coordinate timing with the user. If what you need to capture has to be started by them or only \
 runs for a while (a video, an animation, a boot sequence), call camera_message with \
 wait_for_done_seconds asking them to start it, then record as soon as they tap Done. Don't \
@@ -758,6 +795,26 @@ TOOLS = [
         "annotations": {"readOnlyHint": True},
     },
     {
+        "name": "camera_phone_captures",
+        "title": "Get photos and videos the user took",
+        "description": (
+            "Fetch the photos and videos the user took themselves with the Claude Cam app's shutter and record "
+            "buttons. Call it when the user says they've taken a picture or video for you, or when camera_status "
+            "says some are waiting. The app holds them (not in the phone's gallery) until they're sent here, then "
+            "deletes them from the phone. Photos come back as images and are saved in ~/Pictures/Claude Cam. "
+            "Videos are saved in ~/Videos/Claude Cam and get the same analysis as camera_record_video. "
+            "Look at earlier ones again in those folders."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "count": {"type": "integer", "minimum": 1, "maximum": 20, "description": "At most this many, newest first (default 10)."},
+                "max_size": {"type": "integer", "minimum": 160, "maximum": 4000, "description": "Longest edge of returned photos (default 1568)."},
+                "analyze": {"type": "boolean", "description": "Frame statistics and a contact sheet for videos (default true for videos up to 30 s)."},
+            },
+        },
+    },
+    {
         "name": "camera_control",
         "title": "Adjust the camera",
         "description": (
@@ -890,6 +947,12 @@ class Tools:
                 for c in d["cameras"]
             )
             lines.append(f"Back cameras: {cams}. Recordings use whichever camera can do the requested frame rate.")
+        if d.get("captures_waiting"):
+            n = d["captures_waiting"]
+            lines.append(
+                f"The user has {n} photo(s)/video(s) waiting in the app for you. Fetch them with camera_phone_captures "
+                "when they're relevant (ask the user if you're not sure)."
+            )
         rec = hub.recording
         if rec and not rec.done.done():
             lines.append(f"Recording now: {time.time() - rec.started_at:.0f} s so far ({self._describe_start(rec)}).")
@@ -1274,6 +1337,35 @@ class Tools:
                 content.append(image_block(jpeg_bytes(im, max_size, 85)))
         return content
 
+    async def t_phone_captures(self, args: dict) -> list[dict]:
+        hub = self.hub
+        hub.require_device()
+        count = int(clamp(int(args.get("count") or 10), 1, 20))
+        max_size = int(clamp(int(args.get("max_size") or 1568), 160, 4000))
+        waiting = await hub.list_captures()
+        if not waiting:
+            return [text_block(
+                "The app isn't holding any photos or videos for you. If the user meant to send one, ask them to take "
+                "it with the shutter (photo) or record button in Claude Cam, then tell you."
+            )]
+        picked = waiting[:count]
+        content: list[dict] = []
+        summary = [f"{len(waiting)} item(s) were waiting in the app; fetched {len(picked)} (newest first)."]
+        if len(waiting) > len(picked):
+            summary.append(f"{len(waiting) - len(picked)} more are still on the phone; call again to get them.")
+        content.append(text_block(" ".join(summary)))
+        for cap in picked:
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime((cap.get("taken_at") or 0) / 1000))
+            path = await hub.fetch_capture(cap)
+            if cap.get("kind") == "photo":
+                frame = Frame(time.time(), path.read_bytes(), 0, 0, "photo")
+                data, w, h = render(frame, max_size=max_size, rotate=0, quality=85)
+                content.append(text_block(f"Photo the user took at {when}, saved to {path} (shown at {w}x{h})."))
+                content.append(image_block(data))
+            else:
+                content += await self._video_report(path, f"Video the user took on the phone at {when}.", None, args)
+        return content
+
     async def t_message(self, args: dict) -> list[dict]:
         wait = float(clamp(float(args.get("wait_for_done_seconds") or 0), 0, 900))
         vibrate = args.get("vibrate", True) is not False
@@ -1395,6 +1487,8 @@ def build_app(hub: Hub) -> web.Application:
                             hub.resolve(data.get("req"), error=data.get("error") or "unknown error")
                     elif kind in ("record_stopped", "record_error"):
                         hub.on_record_event(data)
+                    elif kind == "upload_failed":
+                        hub.on_upload_failed(data)
                     elif kind == "import_offer":
                         await dev.send({"type": "import_ready", "token": hub.offer_import(data)})
                     elif kind == "ack":
@@ -1531,7 +1625,10 @@ def build_app(hub: Hub) -> web.Application:
         token = request.match_info["token"]
         rec = hub.recording
         imported = hub.imports.pop(token, None)
-        if imported is not None:
+        expected = hub.expected.get(token)
+        if expected is not None:
+            path = expected[0]
+        elif imported is not None:
             original = Path(imported)
             path = video.new_recording_path(f"from-phone-{original.stem}", None, original.suffix.lower() or ".mp4")
         elif rec is not None and token == rec.token and not rec.done.done():
@@ -1552,8 +1649,11 @@ def build_app(hub: Hub) -> web.Application:
             part.unlink(missing_ok=True)
             log.warning("recording upload failed: %s", e)
             raise web.HTTPBadRequest(text=f"upload failed: {e}\n") from None
-        log.info("video saved: %s (%.1f MB)", path, size / 1e6)
-        if imported is not None:
+        log.info("saved from the phone: %s (%.1f MB)", path, size / 1e6)
+        if expected is not None:
+            if not expected[1].done():
+                expected[1].set_result(path)
+        elif imported is not None:
             hub.on_import(path)
         elif not rec.done.done():
             rec.done.set_result(path)
