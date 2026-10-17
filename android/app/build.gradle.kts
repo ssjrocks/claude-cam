@@ -27,8 +27,8 @@ android {
         minSdk = 26
         targetSdk = 35
         // claudecam.versionCode/versionName only exist to test the in-app updater.
-        versionCode = (findProperty("claudecam.versionCode") as String?)?.toInt() ?: 3
-        versionName = (findProperty("claudecam.versionName") as String?) ?: "1.3.0"
+        versionCode = (findProperty("claudecam.versionCode") as String?)?.toInt() ?: 4
+        versionName = (findProperty("claudecam.versionName") as String?) ?: "1.3.1"
         buildConfigField("String", "DEFAULT_SERVER", "\"$defaultServer\"")
         buildConfigField("String", "UPDATE_API", "\"$updateApi\"")
     }
