@@ -48,5 +48,10 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+        <!-- Crash and problem reports to ssjrocks.com (~/dev/app-reports) -->
+        <provider
+            android:name="com.ssjrocks.appreports.AppReportsInit"
+            android:authorities="${applicationId}.appreports"
+            android:exported="false" />
     </application>
 </manifest>

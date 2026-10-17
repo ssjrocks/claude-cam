@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.graphics.Paint
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
@@ -81,6 +82,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
 import com.google.common.util.concurrent.ListenableFuture
+import com.ssjrocks.appreports.AppReports
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -1597,16 +1599,26 @@ class MainActivity : ComponentActivity(), CamLink.Listener {
             setPadding(0, dp(12), 0, 0)
             alpha = 0.7f
         }
+        val report = TextView(this).apply {
+            text = "Report a problem"
+            setPadding(0, dp(12), 0, dp(4))
+            paintFlags = paintFlags or Paint.UNDERLINE_TEXT_FLAG
+        }
         layout.addView(info)
         layout.addView(input)
         layout.addView(version)
-        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+        layout.addView(report)
+        val dialog = AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Claude Cam server")
             .setView(layout)
             .setPositiveButton("Connect") { _, _ -> link.setManualTarget(input.text.toString()) }
             .setNeutralButton("Check for updates") { _, _ -> checkForUpdatesNow() }
             .setNegativeButton("Cancel", null)
             .show()
+        report.setOnClickListener {
+            dialog.dismiss()
+            AppReports.showReportDialog(this, mapOf("server" to link.target))
+        }
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).roundToInt()
