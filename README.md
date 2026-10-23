@@ -305,7 +305,7 @@ Claude Cam talks to one phone at a time. Tap the status bar on the phone you wan
 - There's **no pairing**: any device on your Wi-Fi could connect as "the phone". Use it on networks
   you trust, like your home. Avoid public Wi-Fi.
 - **Crash reports** (from app 1.3.1): if the app crashes or freezes, the next time it opens it sends a
-  report to the developer's server (`ssjrocks.com`) so the bug can be fixed. A report holds the error
+  report to the developer's server so the bug can be fixed. A report holds the error
   and stack trace, the app's own recent log lines, the phone model and Android version, the app version and
   a random install id. It never includes pictures, video or anything from other apps. **Gear → Report a
   problem** sends the same kind of report, with your note, when you choose to.
